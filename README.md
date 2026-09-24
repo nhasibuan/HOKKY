@@ -1,128 +1,157 @@
 # HOKKY V4.22 ATR
 
-HOKKY is a single-file MetaTrader 4 Expert Advisor focused on ATR-normalized grid/recovery trading with layered exits, persistent risk state, and instance lease protection. This repository is the reference codebase for the hardened rebuild described in the project and is intended for controlled demo testing before deployment to a live account.
+HOKKY is a single-file MetaTrader 4 Expert Advisor (EA) written in MQL4. The inspected source implements a directional ATR-scaled grid/recovery strategy with basket and per-order exits, persistent state in MT4 terminal global variables, drawdown/session controls, and a best-effort single-instance lease.
 
-## Product purpose
+> **Status:** This README documents the source at commit `0fe2bae89fd0d5622ad74578c1000348d14d8a3f`. The review is a static source review; it is not a claim of profitable behavior, broker compatibility, or live-trading safety. Compile, Strategy Tester, demo, and broker-specific validation are still required.
 
-- Automate a directional grid/recovery strategy with ATR-based spacing.
-- Maintain a persistent risk ledger across restarts using global variables.
-- Enforce drawdown and session protection gates before new trades are opened.
-- Support a single-file deployment model to simplify distribution and code review.
-- Prioritize safety, restart recovery, and orderly close-all behavior over aggressive automation.
+## Detailed paraphrase
 
-## Product requirements
+At startup the EA:
 
-### Functional requirements
-1. The EA must run as a single MQ4 source file with no external dependencies beyond standard MQL4 includes.
-2. It must maintain a single account-bound magic number and instance lease to prevent duplicate EA instances from conflicting.
-3. It must validate trading inputs at initialization and reject unsafe configurations.
-4. It must use ATR as the primary spacing and exit reference for basket and individual entries.
-5. It must support initial basket entry, grid add-on entries, and recovery-lot progression.
-6. It must enforce basket-level TP/SL logic, individual hard SL/TP logic, and account/session drawdown limits.
-7. It must persist basket state and risk state across restarts via global variables.
-8. It must maintain a journal log of major trade actions when enabled.
-9. It must support dashboard labeling and state reporting for monitoring.
-10. It must use safe order functions to modify, close, or protect orders under transient broker conditions.
+1. Seeds its pseudo-random generator and creates an owner token.
+2. Validates a subset of the trading parameters.
+3. Resolves a magic number, either from `InpMagicNumber` or from a persisted account/server/symbol-derived value.
+4. Builds names for persistent global variables and chart objects.
+5. Attempts to acquire an instance lease. A recent heartbeat blocks another instance using the same identity.
+6. Loads persisted basket, recovery, session, and risk state.
+7. Rebuilds its cache of open market orders for the current symbol and magic number.
+8. Optionally purges persisted state, but only when no managed orders are open.
+9. Applies an optional, numbered state-reset command.
+10. Restores an active basket when open managed orders exist, obtains a closed-bar ATR value, scans history, and enters one of the startup, waiting, running, or drawdown-latched states.
 
-### Operational requirements
-- Intended for MT4 strategy testing and controlled demo validation.
-- Requires a broker account / symbol / timeframe configuration that supports the relevant trading logic.
-- Trading hours, maximum spread, ATR validity, and order protection conditions must be checked before opening new positions.
-- Input validation must block invalid lot sizing, invalid ATR settings, or non-existent exit mechanisms.
-- Any configured risk latch must require explicit reset or recovery logic.
+During operation, `OnTick` refreshes the lease heartbeat, ATR, order cache, and history state. It then prioritizes close-all handling, persistent drawdown latches, risk stops, ATR availability, logical exits, and broker-side protection reconciliation. Only after those gates pass does it process a new chart bar and consider opening or adding to a basket. `OnTimer` maintains the heartbeat, persists state, retries pending close-all work, and refreshes the dashboard.
 
-### Non-functional requirements
-- Reliability: Orders and state must be reconciled consistently during runtime and after restart.
-- Safety: Risk stops and close-all routines must be able to prevent runaway exposure.
-- Maintainability: Code must be self-contained and understandable in a single file.
-- Auditability: Persistent risk state and journal entries should support later review.
-- Reproducibility: Critical parameters must be explicit and visible in the source for testing and review.
+The trading model is directional rather than hedged: an initial position is selected from the relationship between the two most recent completed closes. If a position moves adversely by an ATR-scaled distance, same-direction add-ons may be opened, subject to level, lot, exposure, margin, spread, schedule, and optional trend checks. The source also defines ADX inputs, but their actual runtime use should be confirmed in the remainder of the file before describing ADX as an active filter.
 
-## Best-practice MQL4 design pattern used
+Exits are layered:
 
-This implementation follows a defensive MQL4 design pattern intended for high-friction broker conditions:
+- Basket TP and optional basket SL use the current ATR multiplied by the configured factor.
+- Optional individual soft exits and individual TP are evaluated on ticks.
+- A hard individual stop is reconciled to the broker using `OrderModify` when possible.
+- Drawdown, session drawdown, and margin conditions can stop further activity and may request close-all behavior.
+- A persistent equity-stop latch can keep the EA from restarting trading until an explicit reset or configured cooldown releases it.
 
-- Single entrypoint lifecycle with init, timer, tick, and deinit functions.
-- Atomic validation and initialization gates before trading begins.
-- Global variable backed persistent state for strategy continuity and recovery.
-- Cache refresh pattern for order state and history accumulation.
-- Explicit state machine for startup, waiting for ATR, running, close-all pending, drawdown latch, and protection fault.
-- Safe wrappers around OrderSend, OrderModify, and OrderClose to retry transient broker errors.
-- Protection routes to trigger a fast close-all before the EA continues unsafe behavior.
-- Local safety checks for stop-level, spread, margin, and market context usability before sending trades.
+Recovery mode persists the next recovery lot. After a basket closes, a losing basket increases the next base lot by `InpMultiplier`, while a non-losing basket resets it to `InpLots`; per-order and recovery caps are then applied.
 
-## SWOT analysis summary
+## Configuration notes
+
+Important defaults in the inspected source include:
+
+- `InpDbLots = LOT_MULTIPLIER`, `InpLots = 0.01`, `InpMultiplier = 1.60`.
+- `InpMaxLevel = 20`, `InpMaxLotPerOrder = 1.00`, `InpMaxTotalLots = 5.00`.
+- Basket TP is enabled at an ATR factor of `0.75`; hard protection is enabled at an ATR factor of `6.00`.
+- `InpMaxDrawdownPct = 20.0` and `InpMaxSessionDDPct = 12.0`.
+- Trend and ADX filters are disabled by default.
+
+Despite names ending in `Pips`, `InpBasketSL_Pips` and `InpHardSLPips` are passed through `ATRDistance()`. In the inspected implementation they are ATR multipliers, not literal pip distances. The same ATR-scaling convention applies to the other distance-style exit inputs.
+
+The source exposes trading-hour, spread, trend, ADX, dashboard, and journal settings. Their operational behavior should be tested against the compiled full file and broker because declarations alone do not prove that an option affects every intended path.
+
+## Functional requirements represented by the source
+
+- Single MQ4 deployment with the standard `stderror.mqh` include.
+- Account/server/symbol/magic-scoped identity and persistent global-variable state.
+- One active instance lease with a heartbeat and stale-lease timeout.
+- ATR derived from a completed bar before trading is allowed.
+- Directional initial entries and same-direction ATR-spaced add-ons.
+- Fixed, multiplier, and recovery lot modes.
+- Basket and individual logical exits plus broker-side hard protection.
+- Maximum level, per-order lot, total-lot, margin, spread, and drawdown gates.
+- Restart recovery for basket, session, recovery-lot, and equity-latch state.
+- Dashboard and optional journal functionality as exposed by inputs.
+
+## SWOT analysis
 
 ### Strengths
-- Single-file architecture minimizes distribution complexity.
-- ATR-based grid spacing makes order placement and exits adaptive to volatility.
-- Persistent state reduces the risk of forgetting prior risk context after restart.
-- Strong risk-latch logic can stop the strategy from continuing after a drawdown breach.
-- Safe order wrappers make retries and transient broker errors more resilient.
+
+- **Defensive lifecycle:** initialization, timer, tick, and deinitialization paths are separated, and the explicit EA state enum makes major operating modes visible.
+- **Restart continuity:** basket identity, session baseline, peak state, recovery lot, and equity latch are persisted rather than held only in RAM.
+- **Volatility adaptation:** ATR-based spacing and exits can adjust to the symbol and timeframe's recent volatility.
+- **Exposure controls:** the design includes level, total-lot, per-order, recovery-lot, free-margin, spread, and margin-level controls.
+- **Layered protection:** logical exits are supplemented by broker-side SL/TP reconciliation and close-all retry paths.
+- **Operational observability:** dashboard, alerts, state reasons, comments, and optional CSV journaling provide useful monitoring hooks.
+- **Distribution simplicity:** a single strategy file reduces packaging and dependency problems.
 
 ### Weaknesses
-- Grid and recovery systems can become high-risk if volatility spikes or adverse momentum persists.
-- Single-file complexity makes debugging and maintenance harder without disciplined code organization.
-- Global-variable state can drift if the EA is not properly reset or if multiple instances conflict.
-- The code depends heavily on broker behavior and standard MT4 market conditions, which may vary widely.
+
+- **Grid/recovery convexity:** adverse directional movement can accumulate exposure and losses faster than a user expects, even with caps.
+- **Static global-variable state:** terminal global variables are mutable shared state; stale, manually edited, corrupted, or colliding values can change behavior.
+- **Single-file maintenance cost:** strategy, persistence, execution, risk, UI, and logging concerns are tightly coupled, making regression testing difficult.
+- **ATR is not a risk budget:** multiplying ATR by a factor does not guarantee a fixed monetary loss across symbols, contract sizes, gaps, or leverage.
+- **Terminology risk:** pip-suffixed inputs are implemented as ATR factors, which can cause unsafe configuration assumptions.
+- **Broker dependence:** execution, stop levels, freeze levels, requotes, disconnections, symbol digits, and market closures can defeat intended timing.
 
 ### Opportunities
-- Improve observability with richer reporting and event logs.
-- Add controlled strategy parameter presets for demo sessions and paper testing.
-- Introduce optional portfolio logic or multi-symbol support in a future modular refactor.
-- Add stricter market regime filters to reduce poor entry quality during high-volatility or low-liquidity periods.
+
+- Add unit-testable pure functions for lot sizing, risk calculations, basket accounting, and state transitions.
+- Replace implicit global-variable schema handling with versioned migration, checksums, timestamps, and explicit corruption recovery.
+- Add a maximum monetary loss or percentage-of-equity budget per basket, not only distance and lot caps.
+- Add broker/terminal fault-injection tests for partial close-all failure, lost connectivity, invalid stops, and lease races.
+- Make every declared input auditable with a configuration table and automated checks that detect unused or weakly enforced inputs.
+- Add a separate backtest/reporting harness for spread, slippage, commission, swap, gaps, and worst-case excursion.
+- Prefer a modular implementation or generated single-file release so production distribution remains simple without sacrificing testability.
 
 ### Threats
-- Over-optimization and unrealistic assumptions can produce fragile behavior in live trading.
-- Recovery logic may increase exposure beyond intended risk limits under extended losses.
-- Broker outages, spread widening, or invalid stop conditions can trigger repeated fail-safe paths.
-- Duplicate instances or stale global variables can cause unintended coordination issues.
 
-## How to overcome the weaknesses
+- Persistent trends, volatility regime shifts, gaps, and thin liquidity can defeat mean-reversion/grid assumptions.
+- Spread widening and slippage can make ATR-scaled exits materially worse than their nominal levels.
+- A terminal crash, VPS outage, or lease race can leave positions dependent on already-installed broker protection.
+- Incorrect state reset, magic-number reuse, or another EA using the same identity can mix operational ownership.
+- Backtest overfitting can hide live execution and regime risks.
+- A recovery multiplier can encourage users to increase risk after losses and may approach broker/account limits.
 
-1. Use conservative input defaults and validate them before live deployment.
-2. Treat recovery progression as a controlled fallback, not a strategy core.
-3. Add hard exposure caps and enforce them before each order send.
-4. Keep the grid spacing and drawdown thresholds grounded in actual prior test history.
-5. Require a demo-validation loop before using the EA on a live account.
-6. Review the persistent state reset path and ensure commands are only processed when no open managed orders exist.
-7. Monitor broker behavior and spread conditions continuously so trades are blocked when the environment is not suitable.
+## Verified facts and limitations
 
-## Risk mitigation measures
+The following are directly supported by the inspected source at the pinned commit:
 
-- Drawing a strict difference between basket-level exits and individual hard exits.
-- Preventing new orders when drawdown or margin risk exceeds thresholds.
-- Latching an equity stop after risk events so the EA does not continue trading in a failed state.
-- Closing all managed orders using safe close routines during protection sequences.
-- Checking spread, stop-level, and market context before order placement.
-- Retrying transient trade errors and stopping only on non-transient conditions.
-- Persisting reset commands and risk state through global variables for deterministic restarts.
+- The source declares `#property strict`, version `4.22`, and a single EA file with `stderror.mqh`.
+- `OnInit`, `OnTick`, `OnTimer`, and `OnDeinit` implement the lifecycle.
+- The source uses `iATR(..., 1)`, i.e. the last completed bar, and blocks trading while ATR is invalid.
+- Open orders are filtered by current symbol and `g_magic`; only market buys and sells are cached.
+- Basket state and risk-related values are stored under account/server/symbol/magic-scoped terminal global-variable names.
+- A lease uses owner and heartbeat global variables and refuses a fresh competing owner.
+- The source explicitly checks the return value of `SafeOrderClose` in individual exits and documents the `CloseAll` return-value hardening in its header.
+- The source has explicit operator parentheses in the history order-type/close-time condition.
+- `InpBasketSL_Pips` and `InpHardSLPips` are converted through `ATRDistance()`, so they are not literal pip distances in the inspected code.
 
-## Verified fact
-
-This repository currently contains the single-file EA source and a minimal README scaffold. The project is intended as a focused, self-contained MQL4 strategy implementation and is not a finished live-trading guarantee. It must be treated as a controlled strategy artifact requiring validation before real-money use.
+This review does **not** verify profitability, compile success on a particular MT4 build, broker execution semantics, or the behavior of functions beyond the excerpt available for static inspection. Those claims require reproducible compilation and tests.
 
 ## Adversarial review
 
-This code demonstrates competent MQL4 guardrails but still carries the inherent dangers of grid/recovery logic. The strongest positives are the professional state machine, safe wrappers, drawdown enforcement, and persistent risk logic. The main weaknesses are exposure growth, global state complexity, and dependence on broker execution behavior. The code is safer than a naive grid EA, but it is not risk-free. It should be considered a defensive framework for a discretionary strategy concept rather than a guaranteed profit engine.
+### High-priority findings
+
+1. **Lease loss does not close positions.** `UpdateHeartbeat()` sets `g_leaseLost` and a protection-fault state, but both `OnTick()` and `OnTimer()` return immediately when `g_leaseLost` is true. Therefore the advertised protection-fault close-all path is bypassed after lease loss. Existing broker-side stops may remain, but the EA no longer actively manages or closes those orders. Decide explicitly whether lease loss should fail closed by closing orders, or fail passive with a documented operator alert and guaranteed broker protection.
+
+2. **Newest-order cache is not reset in `RefreshCache()`.** The function resets counts, lots, averages, and floating P/L, but the displayed source does not reset `g_buyNewestTime`, `g_buyNewestTicket`, `g_buyNewestPrice`, or the sell equivalents. Values from a prior basket or prior side can remain when no order of that side exists, producing stale add-on comparisons after a restart or basket transition. Reset all newest-order fields at the beginning of every cache rebuild.
+
+3. **Distance names can mislead risk configuration.** Pip-suffixed parameters are ATR multipliers. A user setting `6` does not mean six pips; it means six times the current ATR. Rename them or document the conversion in the input comments and dashboard.
+
+### Medium-priority findings
+
+4. **History accounting is stateful and fragile.** `UpdateHistoryState()` resumes from an integer history position. History ordering, broker history visibility, or changes to the selected history range can make position-based incremental accounting miss or double-process records. Rebuild from a stable cursor such as ticket/close-time, or recompute the relevant scoped totals when correctness matters.
+
+5. **Lease time uses local terminal time.** Lease freshness uses `TimeLocal()`, while trading and persistent state use server time (`TimeCurrent()`). Clock changes, VPS drift, daylight changes, or different machines can make a lease appear fresh or stale unexpectedly. Use a clearly defined clock source and test restarts across terminals.
+
+6. **Protection is initially reactive.** Broker SL/TP reconciliation happens after an order is opened and on subsequent processing. A send/modify failure, disconnect, or immediate price move can leave a position temporarily without the intended broker-side protection. The close-all and retry behavior must be tested under forced trade-context failures.
+
+7. **Static validation is incomplete.** The visible `ValidateInputs()` checks key ATR, lot, multiplier, level, and exit conditions, but does not itself reject every potentially unsafe value such as negative drawdown thresholds, invalid session hours, or inconsistent exposure settings. Add explicit range and cross-field validation, and fail closed on invalid risk inputs.
+
+### Required validation before live use
+
+- Compile with the target MT4 build using warnings treated as errors.
+- Test the lease race with two terminals, restart timing, local-clock changes, and forced global-variable edits.
+- Test every close-all path with requotes, off quotes, trade context busy, market closed, partial success, and terminal disconnects.
+- Verify that broker-side hard stops are installed immediately and remain valid when ATR changes.
+- Reconcile journal/history totals against broker statements after partial closes and terminal restarts.
+- Run stress tests across trending, gapping, high-spread, low-liquidity, and rapidly changing ATR conditions.
+- Use demo or a dedicated test account before any live deployment, with a separately enforced account-level loss limit.
 
 ## Repository update
 
-The repository is updated to include the hardened single-file EA and this product requirement summary.
-
-- Source file: `EA_HOKKYDJONG_V4_ATR.mq4`
-- Repository: https://github.com/nhasibuan/HOKKY
-- Product requirements: https://github.com/nhasibuan/HOKKY/blob/main/README.md
+- EA source: [`EA_HOKKYDJONG_V4_ATR.mq4`](EA_HOKKYDJONG_V4_ATR.mq4)
+- Repository: <https://github.com/nhasibuan/HOKKY>
+- Reviewed commit: `0fe2bae89fd0d5622ad74578c1000348d14d8a3f`
 
 ## Disclaimer
 
-This project is for educational and strategy-development use. It is not financial advice. Demo testing, broker validation, and risk review are required before any live deployment.
-
----
-
-HOKKY V4.22 ATR
-
-"ATR-normalized grid/recovery EA with layered exits, persistent risk state, and instance lease."
-
-
-
+This project is for educational and strategy-development use. It is not financial advice and is not a guarantee of safety or performance. Grid and recovery trading can lose substantial capital, including during gaps or execution failures. Demo testing, broker validation, independent risk review, and conservative account-level limits are required before live deployment.
