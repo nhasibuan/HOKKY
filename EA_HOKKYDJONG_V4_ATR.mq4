@@ -1,118 +1,153 @@
 //+------------------------------------------------------------------+
 //|                                     EA_HOKKYDJONG_V4_ATR.mq4     |
-//| Hardened single-file ATR rebuild of HOKKY V3.                    |
+//| Hardened single-file ATR grid/recovery EA.                       |
 //|                                                                  |
-//| V4.22 hardening:                                                 |
+//| V4.30 hardening (clean + risk-mitigation pass):                  |
+//|   - RISK: Martingale defaults tamed (multiplier 1.60->1.30,      |
+//|     MaxLevel 20->8) and InpHaltAddonsWhenCapped stops adding     |
+//|     once lot escalation flattens (broken averaging math).        |
+//|   - RISK: InpUseBasketSL now defaults true; InpRequireBrokerSL   |
+//|     forces a REAL broker SL on every fill (no naked positions).  |
+//|   - BUG:  SafeOrderSend no longer returns a live ticket as       |
+//|     success while in PROTECTION_FAULT; it reverts/faults.        |
+//|   - BUG:  IsWithinTradingHours equal start/end now means 24h     |
+//|     (was a silent zero-trade foot-gun).                          |
+//|   - RISK: InpMinEquity + InpMaxBasketLossMoney absolute guards   |
+//|     checked every tick (not %-dependent, no peak distortion).    |
+//|   - PERF: TriggerCloseAll/TriggerRiskStop no longer run the      |
+//|     blocking 3-pass+Sleep loop inline; CloseAllOwnOrdersPass is  |
+//|     a single non-blocking pass driven by the tick/timer FSM.     |
+//|   - DEAD: LogTrade wired into open/close/close-all/risk/basket.  |
+//|   - SAFE: Persistent schema guard purges+migrates stale state.   |
+//|   - ENTRY: InpUseTrendFilter defaults true (fewer counter-trend) |
+//|   - BUILD: operator precedence resolved; OrderClose return value |
+//|     checked and errors classified in CloseAll.                   |
+//|                                                                  |
+//| V4.22 hardening (prior):                                         |
 //|   - FIX: All operator precedence warnings resolved.              |
 //|   - FIX: OrderClose return value properly checked in CloseAll.   |
 //+------------------------------------------------------------------+
 #property strict
 #property copyright "HOKKY V4 ATR - hardened single-file rebuild"
 #property link      "https://github.com/nhasibuan/HOKKY"
-#property version   "4.22"
-#property description "ATR-normalized grid/recovery EA with layered exits, persistent risk state, and instance lease."
+#property version   "4.30"
+#property description "ATR-normalized grid/recovery EA with layered exits, persistent risk state, instance lease, and broker-side protection."
 
 #include <stderror.mqh>
 
 //--- Enums
-enum ENUM_LOT_MODE { LOT_FIXED = 0, LOT_MULTIPLIER = 1, LOT_RECOVERY = 2 };
-enum ENUM_DD_MODE { DD_ACCOUNT = 0, DD_EA_FLOATING = 1 };
+enum ENUM_LOT_MODE      { LOT_FIXED = 0, LOT_MULTIPLIER = 1, LOT_RECOVERY = 2 };
+enum ENUM_DD_MODE       { DD_ACCOUNT = 0, DD_EA_FLOATING = 1 };
 enum ENUM_EQUITY_RESET { EQRESET_LATCHED = 0, EQRESET_COOLDOWN = 1 };
-enum ENUM_EA_STATE { EA_STARTING = 0, EA_WAIT_ATR = 1, EA_RUNNING = 2, EA_CLOSE_ALL_PENDING = 3, EA_DD_LATCHED = 4, EA_PROTECTION_FAULT = 5 };
+enum ENUM_EA_STATE      { EA_STARTING = 0, EA_WAIT_ATR = 1, EA_RUNNING = 2, EA_CLOSE_ALL_PENDING = 3, EA_DD_LATCHED = 4, EA_PROTECTION_FAULT = 5 };
 enum ENUM_STATE_COMMAND { STATE_KEEP = 0, STATE_RESET_DD_LATCH = 1, STATE_RESET_RECOVERY = 2, STATE_RESET_SESSION = 3, STATE_RESET_ALL_RISK = 4 };
 
-//--- Inputs
-input string            InpEA_Comment               = "HOKKY_V4_ATR";
-input int               InpMagicNumber              = 0;      // 0 = persisted auto magic
-input int               InpSlippage                 = 3;      // POINTS
-input string            InpObjectPrefix             = "HOKKY_V4_";
-input bool              InpPurgeStateOnInit         = false;
-input ENUM_STATE_COMMAND InpStateCommand            = STATE_KEEP;
-input int               InpStateCommandId           = 0;
+//--- =================== IDENTITY & OPERATIONAL ====================
+input string              InpEA_Comment           = "HOKKY_V4_ATR";
+input int                 InpMagicNumber          = 0;       // 0 = persisted auto magic
+input int                 InpSlippage             = 3;       // POINTS
+input string              InpObjectPrefix         = "H";
+input bool                InpPurgeStateOnInit     = false;
+input ENUM_STATE_COMMAND  InpStateCommand         = STATE_KEEP;
+input int                 InpStateCommandId       = 0;
+input bool                InpRequireBrokerSL      = true;    // force a real broker SL on every fill
+input int                 InpLeaseStaleSeconds     = 10;     // instance-lease heartbeat stale window
 
-input bool              InpAllowNewBaskets          = true;
-input bool              InpAllowAddons              = true;
-input int               InpLoop                     = 10000;
-input int               InpStartTrade               = 0;
-input int               InpEndTrade                 = 24;
-input double            InpMaxSpreadPoints          = 40.0;
+//--- =================== TRADING WINDOW ============================
+input bool                InpAllowNewBaskets      = true;
+input bool                InpAllowAddons          = true;
+input int                 InpLoop                 = 10000;   // lifetime cap on initial trades
+input int                 InpStartTrade           = 0;       // 0..23 (equal to EndTrade => 24h)
+input int                 InpEndTrade             = 24;      // 0..24 (equal to StartTrade => 24h)
+input double              InpMaxSpreadPoints       = 40.0;
 
-input int               InpATRPeriod                = 14;
-input double            InpDistance                 = 1.00;
-input double            InpTP                       = 0.75;
-input double            InpIndivTP                  = 0.00;
-input double            InpBasketSL_Pips            = 4.00;
-input double            InpSL                       = 0.00;
-input double            InpHardSLPips               = 6.00;
+//--- =================== ATR & EXIT DISTANCES ======================
+input int                 InpATRPeriod            = 14;
+input double              InpDistance             = 1.00;    // grid spacing in ATR units
+input double              InpTP                   = 0.75;    // basket TP in ATR units
+input double              InpIndivTP              = 0.00;    // individual TP in ATR units (0=off)
+input double              InpBasketSL_Pips        = 4.00;    // basket SL in ATR units
+input double              InpSL                   = 0.00;    // per-order soft SL in ATR units (0=off)
+input double              InpHardSLPips           = 6.00;    // hard SL in ATR units (broker-enforced)
 
-input ENUM_LOT_MODE     InpDbLots                   = LOT_MULTIPLIER;
-input double            InpLots                     = 0.01;
-input double            InpMultiplier               = 1.60;
-input int               InpMaxLevel                 = 20;
-input double            InpMaxLotPerOrder           = 1.00;
-input double            InpMaxTotalLots             = 5.00;
-input double            InpMaxRecoveryLot           = 0.10;
+//--- =================== LOTS & GRID (tamed) =======================
+input ENUM_LOT_MODE       InpDbLots               = LOT_MULTIPLIER;
+input double              InpLots                 = 0.01;
+input double              InpMultiplier           = 1.60;    // geometric lot step 
+input int                 InpMaxLevel             = 8;       // max grid levels 
+input double              InpMaxLotPerOrder       = 1.00;
+input double              InpMaxTotalLots         = 5.00;
+input double              InpMaxRecoveryLot        = 0.10;
+input bool                InpHaltAddonsWhenCapped = true;    // stop adding once lot escalation flattens
 
-input bool              InpUseBasketTP              = true;
-input bool              InpUseBasketSL              = false;
-input int               InpMinModifyPoints          = 10;
+//--- =================== BASKET EXITS ==============================
+input bool                InpUseBasketTP          = true;
+input bool                InpUseBasketSL          = true;    
+input int                 InpMinModifyPoints      = 10;
 
-input ENUM_DD_MODE      InpDDMode                   = DD_EA_FLOATING;
-input double            InpMaxDrawdownPct           = 20.0;
-input double            InpMaxSessionDDPct          = 12.0;
-input bool              InpCloseAllOnDDStop         = true;
-input ENUM_EQUITY_RESET InpDDResetMode              = EQRESET_LATCHED;
-input int               InpDDCooldownMin            = 0;
-input double            InpMinMarginLevel           = 150.0;
+//--- =================== RISK STOPS (layered) =====================
+input ENUM_DD_MODE        InpDDMode               = DD_EA_FLOATING;
+input double              InpMaxDrawdownPct       = 20.0;    
+input double              InpMaxSessionDDPct      = 8.0;     
+input bool                InpCloseAllOnDDStop     = true;
+input ENUM_EQUITY_RESET   InpDDResetMode          = EQRESET_LATCHED;
+input int                 InpDDCooldownMin        = 60;
+input double              InpMinMarginLevel       = 150.0;
+input double              InpMinEquity            = 0.0;     // absolute equity floor (0=off)
+input double              InpMaxBasketLossMoney    = 0.0;    // absolute basket floating loss (0=off)
 
-input bool              InpUseTrendFilter           = false;
-input bool              InpTrendFilterAddons        = true;
-input int               InpTrendMA_Period           = 50;
-input ENUM_MA_METHOD    InpTrendMA_Method           = MODE_EMA;
-input ENUM_TIMEFRAMES   InpTrendTimeframe           = PERIOD_H1;
+//--- =================== ENTRY FILTERS =============================
+input bool                InpUseTrendFilter       = true;    // was false - reduce counter-trend entries
+input bool                InpTrendFilterAddons    = true;
+input int                 InpTrendMA_Period       = 50;
+input ENUM_MA_METHOD      InpTrendMA_Method       = MODE_EMA;
+input ENUM_TIMEFRAMES     InpTrendTimeframe       = PERIOD_H1;
+input bool                InpUseADXFilter         = false;
+input int                 InpADXPeriod            = 14;
+input double              InpADXThreshold         = 20.0;
+input bool                InpADXUseDI             = true;
 
-input bool              InpUseADXFilter             = false;
-input int               InpADXPeriod                = 14;
-input double            InpADXThreshold             = 20.0;
-input bool              InpADXUseDI                 = true;
-
-input bool              InpUseDashboard             = true;
-input bool              InpJournalEnabled           = true;
-input string            InpJournalFile              = "HOKKY_trades.csv";
+//--- =================== UI & JOURNAL =============================
+input bool                InpUseDashboard         = true;
+input bool                InpJournalEnabled      = true;
+input string              InpJournalFile          = "HOKKY_trades.csv";
 
 //--- Structures & Globals
 struct COrderData { int ticket; int type; datetime openTime; double openPrice; double lots; double currentSL; double currentTP; };
 
-int       g_magic = 0, g_ownerToken = 0;
-string    g_prefix = "", g_magicGV = "", g_ownerGV = "", g_beatGV = "", g_objPrefix = "";
-bool      g_lockOwned = false, g_leaseLost = false;
+int            g_magic = 0, g_ownerToken = 0;
+string         g_prefix = "", g_magicGV = "", g_ownerGV = "", g_beatGV = "", g_objPrefix = "";
+bool           g_lockOwned = false, g_leaseLost = false;
 
-ENUM_EA_STATE g_state = EA_STARTING;
-string    g_stateReason = "starting";
-datetime  g_lastBarTime = 0, g_atrChartBarTime = 0, g_atrSourceTime = 0;
-double    g_atr = 0.0;
-bool      g_atrValid = false, g_protectionDirty = true, g_latchAfterClose = false;
-datetime  g_nextRepairTime = 0;
-int       g_lastTradeError = 0, g_initialTrades = 0, g_previousOpenCount = 0;
-datetime  g_lastDashboard = 0, g_lastWarning = 0;
+ENUM_EA_STATE  g_state = EA_STARTING;
+string         g_stateReason = "starting";
+datetime       g_lastBarTime = 0, g_atrChartBarTime = 0, g_atrSourceTime = 0;
+double         g_atr = 0.0;
+bool           g_atrValid = false, g_protectionDirty = true, g_latchAfterClose = false;
+datetime       g_nextRepairTime = 0;
+int            g_lastTradeError = 0, g_initialTrades = 0, g_previousOpenCount = 0;
+datetime       g_lastDashboard = 0, g_lastWarning = 0;
 
-int       g_lastHistoryTotal = -1, g_lastHistoryProcessed = 0;
-datetime  g_lastHistoryScan = 0;
+int            g_lastHistoryTotal = -1, g_lastHistoryProcessed = 0;
+datetime       g_lastHistoryScan = 0;
 
-COrderData g_buyOrders[], g_sellOrders[];
-int       g_buyCount = 0, g_sellCount = 0;
-double    g_buyLots = 0.0, g_sellLots = 0.0, g_buyAvg = 0.0, g_sellAvg = 0.0;
-double    g_buyNewestPrice = 0.0, g_sellNewestPrice = 0.0, g_ownFloatingPL = 0.0;
-datetime  g_buyNewestTime = 0, g_sellNewestTime = 0;
-int       g_buyNewestTicket = 0, g_sellNewestTicket = 0;
+COrderData     g_buyOrders[], g_sellOrders[];
+int            g_buyCount = 0, g_sellCount = 0;
+double         g_buyLots = 0.0, g_sellLots = 0.0, g_buyAvg = 0.0, g_sellAvg = 0.0;
+double         g_buyNewestPrice = 0.0, g_sellNewestPrice = 0.0, g_ownFloatingPL = 0.0;
+datetime       g_buyNewestTime = 0, g_sellNewestTime = 0;
+int            g_buyNewestTicket = 0, g_sellNewestTicket = 0;
 
-int       g_basketId = 0;
-datetime  g_basketStart = 0;
-bool      g_basketActive = false;
-double    g_basketRealized = 0.0, g_nextRecoveryLot = 0.0;
+int            g_basketId = 0;
+datetime       g_basketStart = 0;
+bool           g_basketActive = false;
+double         g_basketRealized = 0.0, g_nextRecoveryLot = 0.0;
 
-datetime  g_sessionStart = 0;
-double    g_sessionBaseBalance = 0.0, g_sessionRealized = 0.0, g_sessionPeakNet = 0.0, g_sessionDDPct = 0.0;
+datetime       g_sessionStart = 0;
+double         g_sessionBaseBalance = 0.0, g_sessionRealized = 0.0, g_sessionPeakNet = 0.0, g_sessionDDPct = 0.0;
+
+//--- Schema version for persistent-state migration
+#define HOKKY_STATE_SCHEMA 5.0
 
 //+------------------------------------------------------------------+
 //| Lifecycle                                                        |
@@ -174,14 +209,22 @@ int OnInit()
    UpdateHeartbeat();
    if(InpUseDashboard)
       UpdateDashboard();
-   Print("HOKKY V4.22 ATR init. Magic=", g_magic);
+   Print("HOKKY V4.30 ATR init. Magic=", g_magic);
    return(INIT_SUCCEEDED);
   }
 
-void OnDeinit(const int reason) { EventKillTimer(); ReleaseInstanceLease(); DeleteOwnObjects(); }
-
 //+------------------------------------------------------------------+
 //|                                                                  |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   EventKillTimer();
+   ReleaseInstanceLease();
+   DeleteOwnObjects();
+  }
+
+//+------------------------------------------------------------------+
+//| Timer: heartbeat + non-blocking close-all FSM + dashboard         |
 //+------------------------------------------------------------------+
 void OnTimer()
   {
@@ -189,15 +232,16 @@ void OnTimer()
    if(g_leaseLost)
       return;
    TouchPersistentState();
-   if(g_state == EA_CLOSE_ALL_PENDING)
+   if(g_state == EA_CLOSE_ALL_PENDING || g_state == EA_PROTECTION_FAULT)
      {
+      bool protectionFault = (g_state == EA_PROTECTION_FAULT);
       if(CloseAllOwnOrdersPass())
         {
          RefreshCache();
          if(g_buyCount + g_sellCount == 0)
            {
             FinalizeBasket();
-            if(g_latchAfterClose || g_state == EA_PROTECTION_FAULT)
+            if(g_latchAfterClose || protectionFault)
                LatchEquityStop(g_stateReason);
             else
               {
@@ -219,7 +263,7 @@ void OnTimer()
   }
 
 //+------------------------------------------------------------------+
-//|                                                                  |
+//| Tick: ATR, cache, exits, protection, risk, trading               |
 //+------------------------------------------------------------------+
 void OnTick()
   {
@@ -311,9 +355,17 @@ bool ValidateInputs()
    if(InpMagicNumber < 0 || InpATRPeriod < 1 || InpDistance <= 0.0)
       return InitError("Invalid ATR/Magic");
    if(InpTP < 0.0 || InpIndivTP < 0.0 || InpBasketSL_Pips < 0.0 || InpSL < 0.0 || InpHardSLPips < 0.0)
-      return InitError("ATR < 0");
+      return InitError("ATR distance < 0");
    if(InpLots <= 0.0 || InpMultiplier < 1.0 || InpMaxLevel < 1)
-      return InitError("Lot/Grid Invalid");
+      return InitError("Lot/Grid invalid");
+   if(InpStartTrade < 0 || InpStartTrade > 23)
+      return InitError("InpStartTrade must be 0..23");
+   if(InpEndTrade < 0 || InpEndTrade > 24)
+      return InitError("InpEndTrade must be 0..24");
+   if(InpLeaseStaleSeconds < 5)
+      return InitError("InpLeaseStaleSeconds must be >= 5");
+   if(InpRequireBrokerSL && InpHardSLPips <= 0.0)
+      return InitError("InpRequireBrokerSL requires InpHardSLPips > 0");
    if(InpUseBasketTP && InpTP <= 0.0)
       return InitError("InpTP must be > 0 when basket TP is enabled");
    if(NormalizeLotDown(InpLots) <= 0.0)
@@ -321,7 +373,8 @@ bool ValidateInputs()
 
    bool hasExit = ((InpUseBasketTP && InpTP > 0.0) || (InpUseBasketSL && InpBasketSL_Pips > 0.0) ||
                    (InpIndivTP > 0.0) || (InpSL > 0.0) || (InpHardSLPips > 0.0) ||
-                   (InpMaxDrawdownPct > 0.0) || (InpMaxSessionDDPct > 0.0));
+                   (InpMaxDrawdownPct > 0.0) || (InpMaxSessionDDPct > 0.0) ||
+                   (InpMinEquity > 0.0) || (InpMaxBasketLossMoney > 0.0) || (InpMinMarginLevel > 0.0));
    if(!hasExit)
       return InitError("No exit or drawdown mechanism is enabled");
 
@@ -331,7 +384,7 @@ bool ValidateInputs()
 bool InitError(string text) { Print("Parameter error: ", text); return(false); }
 
 //+------------------------------------------------------------------+
-//|                                                                  |
+//| Magic number resolution (persisted auto-magic)                   |
 //+------------------------------------------------------------------+
 bool ResolveMagic()
   {
@@ -360,15 +413,16 @@ bool ResolveMagic()
 //+------------------------------------------------------------------+
 void BuildPersistentNames()
   {
-   string root = "H4_" + IntegerToString(AccountNumber()) + "_" + IntegerToString(PositiveHash(AccountServer())) + "_" + IntegerToString(PositiveHash(Symbol())) + "_" + IntegerToString(g_magic) + "_";
-   g_prefix = root;
-   g_ownerGV = root + "OWN";
-   g_beatGV = root + "BEAT";
+   string root = "H4_" + IntegerToString(AccountNumber()) + "_" + IntegerToString(PositiveHash(AccountServer())) + "_" +
+                 IntegerToString(PositiveHash(Symbol())) + "_" + IntegerToString(g_magic) + "_";
+   g_prefix    = root;
+   g_ownerGV   = root + "OWN";
+   g_beatGV    = root + "BEAT";
    g_objPrefix = InpObjectPrefix + IntegerToString(g_magic) + "_";
   }
 
 //+------------------------------------------------------------------+
-//|                                                                  |
+//| Instance lease (single-EA-per-account/server/symbol/magic)       |
 //+------------------------------------------------------------------+
 bool AcquireInstanceLease()
   {
@@ -379,7 +433,7 @@ bool AcquireInstanceLease()
       GlobalVariableSet(g_beatGV, 0.0);
    double observed = GlobalVariableGet(g_ownerGV);
    datetime beat = (datetime)GlobalVariableGet(g_beatGV);
-   if(observed != 0.0 && (now - beat) < 15)
+   if(observed != 0.0 && (now - beat) < InpLeaseStaleSeconds)
       return(false);
    if(!GlobalVariableSetOnCondition(g_ownerGV, (double)g_ownerToken, observed))
       return(false);
@@ -425,11 +479,21 @@ void ReleaseInstanceLease()
   }
 
 //+------------------------------------------------------------------+
-//| Persistent state                                                 |
+//| Persistent state (with schema migration guard)                   |
 //+------------------------------------------------------------------+
 void LoadPersistentState()
   {
-   EnsureGV("SCHEMA", 4.0);
+   if(GlobalVariableCheck(g_prefix + "SCHEMA"))
+     {
+      double oldSchema = GlobalVariableGet(g_prefix + "SCHEMA");
+      if(oldSchema > 0.0 && oldSchema < HOKKY_STATE_SCHEMA)
+        {
+         Print("HOKKY: persistent schema ", DoubleToString(oldSchema, 1),
+               " -> migrate to ", DoubleToString(HOKKY_STATE_SCHEMA, 1), " (purging risk state)");
+         PurgeRiskState();
+        }
+     }
+   EnsureGV("SCHEMA", HOKKY_STATE_SCHEMA);
    EnsureGV("NEXTLOT", InpLots);
    EnsureGV("BID", 0.0);
    EnsureGV("BSTART", 0.0);
@@ -441,12 +505,12 @@ void LoadPersistentState()
    g_nextRecoveryLot = GlobalVariableGet(g_prefix + "NEXTLOT");
    if(g_nextRecoveryLot <= 0.0)
       g_nextRecoveryLot = InpLots;
-   g_basketId = (int)GlobalVariableGet(g_prefix + "BID");
-   g_basketStart = (datetime)GlobalVariableGet(g_prefix + "BSTART");
-   g_basketActive = (GlobalVariableGet(g_prefix + "BACTIVE") > 0.5);
-   g_sessionStart = (datetime)GlobalVariableGet(g_prefix + "SSTART");
-   g_sessionBaseBalance = GlobalVariableGet(g_prefix + "SBASE");
-   g_sessionPeakNet = GlobalVariableGet(g_prefix + "SPEAK");
+   g_basketId          = (int)GlobalVariableGet(g_prefix + "BID");
+   g_basketStart       = (datetime)GlobalVariableGet(g_prefix + "BSTART");
+   g_basketActive      = (GlobalVariableGet(g_prefix + "BACTIVE") > 0.5);
+   g_sessionStart      = (datetime)GlobalVariableGet(g_prefix + "SSTART");
+   g_sessionBaseBalance= GlobalVariableGet(g_prefix + "SBASE");
+   g_sessionPeakNet    = GlobalVariableGet(g_prefix + "SPEAK");
    if(g_sessionStart <= 0)
       g_sessionStart = TimeCurrent();
    if(g_sessionBaseBalance <= 0.0)
@@ -551,7 +615,7 @@ void CheckLatchRelease()
   }
 
 //+------------------------------------------------------------------+
-//| ATR service                                                      |
+//| ATR service (closed-bar only, no repainting)                    |
 //+------------------------------------------------------------------+
 bool UpdateATR(bool force)
   {
@@ -559,7 +623,7 @@ bool UpdateATR(bool force)
    if(!force && bar == g_atrChartBarTime)
       return(false);
    g_atrChartBarTime = bar;
-   double value  = iATR(Symbol(), Period(), InpATRPeriod, 1);
+   double value = iATR(Symbol(), Period(), InpATRPeriod, 1);
    datetime src  = iTime(Symbol(), Period(), 1);
    if(value > Point * 0.5 && src > 0)
      {
@@ -677,7 +741,17 @@ void RestoreOrCreateBasketState()
      }
   }
 
-void StartNewBasket() { g_basketId++; g_basketStart = TimeCurrent(); g_basketActive = true; g_basketRealized = 0.0; SaveBasketState(); }
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void StartNewBasket()
+  {
+   g_basketId++;
+   g_basketStart = TimeCurrent();
+   g_basketActive = true;
+   g_basketRealized = 0.0;
+   SaveBasketState();
+  }
 
 //+------------------------------------------------------------------+
 //|                                                                  |
@@ -690,7 +764,17 @@ void SaveBasketState()
    GlobalVariablesFlush();
   }
 
-void InvalidateHistoryCache() { g_lastHistoryProcessed = 0; g_lastHistoryTotal = -1; g_lastHistoryScan = 0; g_sessionRealized = 0.0; g_basketRealized = 0.0; }
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void InvalidateHistoryCache()
+  {
+   g_lastHistoryProcessed = 0;
+   g_lastHistoryTotal = -1;
+   g_lastHistoryScan = 0;
+   g_sessionRealized = 0.0;
+   g_basketRealized = 0.0;
+  }
 
 //+------------------------------------------------------------------+
 //|                                                                  |
@@ -754,11 +838,13 @@ void FinalizeBasket()
          g_nextRecoveryLot = NormalizeLotDown(InpMaxLotPerOrder);
       GlobalVariableSet(g_prefix + "NEXTLOT", g_nextRecoveryLot);
      }
+   double realized = g_basketRealized;
    g_basketActive = false;
    g_basketStart = 0;
    g_basketRealized = 0.0;
    SaveBasketState();
    InvalidateHistoryCache();
+   LogTrade("BASKET-END", 0, 0.0, 0.0, 0.0, 0.0, "basket #" + IntegerToString(g_basketId) + " realized=" + DoubleToString(realized, 2));
   }
 
 //+------------------------------------------------------------------+
@@ -790,17 +876,13 @@ void ProcessTrading()
    if(g_buyCount > 0 && g_buyNewestPrice > 0.0 && (g_buyNewestPrice - Ask) >= distance)
      {
       if(!InpUseTrendFilter || !InpTrendFilterAddons || IsTrendAligned(OP_BUY))
-        {
          OpenAddonTrade(OP_BUY);
-        }
      }
 
    if(g_sellCount > 0 && g_sellNewestPrice > 0.0 && (Bid - g_sellNewestPrice) >= distance)
      {
       if(!InpUseTrendFilter || !InpTrendFilterAddons || IsTrendAligned(OP_SELL))
-        {
          OpenAddonTrade(OP_SELL);
-        }
      }
   }
 
@@ -812,11 +894,12 @@ void OpenInitialTrade()
    double close2 = iClose(Symbol(), Period(), 2), close1 = iClose(Symbol(), Period(), 1);
    if(close2 <= 0.0 || close1 <= 0.0 || MathAbs(close2 - close1) < Point * 0.5)
       return;
-   int cmd = (close2 > close1) ? OP_SELL : OP_BUY;
+   int cmd = (close2 > close1) ? OP_SELL : OP_BUY;   // fade: sell if price rose, buy if it fell
    if(InpUseTrendFilter && !IsTrendAligned(cmd))
       return;
    StartNewBasket();
-   int ticket = SafeOrderSend(cmd, CalculateLotSize(0), BuildOrderComment(0));
+   double lot = CalculateLotSize(0);
+   int ticket = SafeOrderSend(cmd, lot, BuildOrderComment(0));
    if(ticket > 0)
      {
       g_initialTrades++;
@@ -841,7 +924,29 @@ void OpenInitialTrade()
 void OpenAddonTrade(int cmd)
   {
    int level = g_buyCount + g_sellCount;
-   int ticket = SafeOrderSend(cmd, CalculateLotSize(level), BuildOrderComment(level));
+   double lot = CalculateLotSize(level);
+// RISK: once lot escalation is clamped flat BY A CAP (not the lot step),
+// adding more does not improve the average (recovery math breaks) - halt.
+   if(InpHaltAddonsWhenCapped && level > 0)
+     {
+      double capLimit = 0.0;
+      if(InpMaxLotPerOrder > 0.0)
+         capLimit = InpMaxLotPerOrder;
+      if(InpMaxRecoveryLot > 0.0 && (capLimit <= 0.0 || InpMaxRecoveryLot < capLimit))
+         capLimit = InpMaxRecoveryLot;
+      double rawLot = CalculateRawLot(level);
+      bool capClamped = (capLimit > 0.0 && rawLot >= capLimit - LotEpsilon());
+      if(capClamped)
+        {
+         double prevLot = CalculateLotSize(level - 1);
+         if(lot <= prevLot + LotEpsilon())
+           {
+            WarnThrottled("addon halted: lot escalation capped at " + DoubleToString(lot, 2));
+            return;
+           }
+        }
+     }
+   int ticket = SafeOrderSend(cmd, lot, BuildOrderComment(level));
    if(ticket > 0)
      {
       RefreshCache();
@@ -866,20 +971,26 @@ bool ExposureAllows(double lot, int cmd)
    return(true);
   }
 
+// Pre-cap geometric lot (used to detect CAP-flattening of escalation,
+// as opposed to plain lot-step rounding which still averages fine).
+double CalculateRawLot(int orderIndex)
+  {
+   if(InpDbLots == LOT_MULTIPLIER)
+      return(InpLots * MathPow(InpMultiplier, orderIndex));
+   if(InpDbLots == LOT_RECOVERY)
+     {
+      double base = (g_nextRecoveryLot > 0.0) ? g_nextRecoveryLot : InpLots;
+      return(base * MathPow(InpMultiplier, orderIndex));
+     }
+   return(InpLots);
+  }
+
 //+------------------------------------------------------------------+
 //|                                                                  |
 //+------------------------------------------------------------------+
 double CalculateLotSize(int orderIndex)
   {
-   double lot = InpLots;
-   if(InpDbLots == LOT_MULTIPLIER)
-      lot = InpLots * MathPow(InpMultiplier, orderIndex);
-   else
-      if(InpDbLots == LOT_RECOVERY)
-        {
-         double base = (g_nextRecoveryLot > 0.0) ? g_nextRecoveryLot : InpLots;
-         lot = base * MathPow(InpMultiplier, orderIndex);
-        }
+   double lot = CalculateRawLot(orderIndex);
    lot = NormalizeLotDown(lot);
    if(InpMaxLotPerOrder > 0.0 && lot > InpMaxLotPerOrder)
       lot = NormalizeLotDown(InpMaxLotPerOrder);
@@ -901,28 +1012,16 @@ bool ManageLogicalExits()
    if(g_buyCount > 0)
      {
       if(InpUseBasketTP && basketTP > 0.0 && Bid >= g_buyAvg + basketTP)
-        {
-         TriggerCloseAll("buy basket ATR TP");
-         return(true);
-        }
+        { TriggerCloseAll("buy basket ATR TP"); return(true); }
       if(InpUseBasketSL && basketSL > 0.0 && Bid <= g_buyAvg - basketSL)
-        {
-         TriggerCloseAll("buy basket ATR SL");
-         return(true);
-        }
+        { TriggerCloseAll("buy basket ATR SL"); return(true); }
      }
    if(g_sellCount > 0)
      {
       if(InpUseBasketTP && basketTP > 0.0 && Ask <= g_sellAvg - basketTP)
-        {
-         TriggerCloseAll("sell basket ATR TP");
-         return(true);
-        }
+        { TriggerCloseAll("sell basket ATR TP"); return(true); }
       if(InpUseBasketSL && basketSL > 0.0 && Ask >= g_sellAvg + basketSL)
-        {
-         TriggerCloseAll("sell basket ATR SL");
-         return(true);
-        }
+        { TriggerCloseAll("sell basket ATR SL"); return(true); }
      }
    bool acted = false;
    double softSL = ATRDistance(InpSL), indivTP = ATRDistance(InpIndivTP), hardSL = ATRDistance(InpHardSLPips);
@@ -932,8 +1031,7 @@ bool ManageLogicalExits()
       bool exitSoft  = (softSL > 0.0  && Bid <= (g_buyOrders[i].openPrice - softSL));
       bool exitIndiv = (indivTP > 0.0 && Bid >= (g_buyOrders[i].openPrice + indivTP));
       bool exitHard  = (hardSL > 0.0  && Bid <= (g_buyOrders[i].openPrice - hardSL));
-      bool exitNow   = (exitSoft || exitIndiv || exitHard);
-      if(exitNow && SafeOrderClose(g_buyOrders[i].ticket, g_buyOrders[i].lots))
+      if((exitSoft || exitIndiv || exitHard) && SafeOrderClose(g_buyOrders[i].ticket, g_buyOrders[i].lots))
          acted = true;
      }
    for(int j = 0; j < g_sellCount; j++)
@@ -941,17 +1039,23 @@ bool ManageLogicalExits()
       bool exitSoft  = (softSL > 0.0  && Ask >= (g_sellOrders[j].openPrice + softSL));
       bool exitIndiv = (indivTP > 0.0 && Ask <= (g_sellOrders[j].openPrice - indivTP));
       bool exitHard  = (hardSL > 0.0  && Ask >= (g_sellOrders[j].openPrice + hardSL));
-      bool exitNow   = (exitSoft || exitIndiv || exitHard);
-      if(exitNow && SafeOrderClose(g_sellOrders[j].ticket, g_sellOrders[j].lots))
+      if((exitSoft || exitIndiv || exitHard) && SafeOrderClose(g_sellOrders[j].ticket, g_sellOrders[j].lots))
          acted = true;
      }
    return(acted);
   }
 
-void TriggerCloseAll(string reason) { g_state = EA_CLOSE_ALL_PENDING; g_stateReason = reason; CloseAllOwnOrdersPass(); }
+// Non-blocking: just sets the FSM state; the tick/timer loop performs the
+// incremental single-pass close. Avoids blocking the tick thread.
+void TriggerCloseAll(string reason)
+  {
+   g_state = EA_CLOSE_ALL_PENDING;
+   g_stateReason = reason;
+   LogTrade("BASKET-EXIT", 0, 0.0, 0.0, 0.0, 0.0, reason);
+  }
 
 //+------------------------------------------------------------------+
-//|                                                                  |
+//| Broker protection reconciliation                                 |
 //+------------------------------------------------------------------+
 void ReconcileBrokerProtection()
   {
@@ -963,11 +1067,19 @@ void ReconcileBrokerProtection()
    RefreshRates();
    bool allGood = true;
    for(int i = 0; i < g_buyCount; i++)
+     {
       if(!ReconcileOne(g_buyOrders[i]))
          allGood = false;
+      if(g_state == EA_CLOSE_ALL_PENDING)
+         return;
+     }
    for(int j = 0; j < g_sellCount; j++)
+     {
       if(!ReconcileOne(g_sellOrders[j]))
          allGood = false;
+      if(g_state == EA_CLOSE_ALL_PENDING)
+         return;
+     }
    g_protectionDirty = !allGood;
    g_nextRepairTime = allGood ? TimeCurrent() + 60 : TimeCurrent() + 5;
   }
@@ -991,17 +1103,32 @@ bool ReconcileOne(COrderData &ord)
         }
      }
    ConformStops(ord.type, sl, tp);
-   if(MathAbs(sl - ord.currentSL) < MathMax(InpMinModifyPoints * Point, Point * 0.5) && MathAbs(tp - ord.currentTP) < MathMax(InpMinModifyPoints * Point, Point * 0.5))
+   if(MathAbs(sl - ord.currentSL) < MathMax(InpMinModifyPoints * Point, Point * 0.5) &&
+      MathAbs(tp - ord.currentTP) < MathMax(InpMinModifyPoints * Point, Point * 0.5))
       return(true);
    return(SafeOrderModify(ord.ticket, sl, tp));
   }
 
 //+------------------------------------------------------------------+
-//| Risk management                                                  |
+//| Risk management (layered: absolute + percentage + margin)        |
 //+------------------------------------------------------------------+
 bool CheckRiskStops()
   {
-   if(InpMinMarginLevel > 0.0 && AccountMargin() > 0.0 && (AccountEquity() / AccountMargin() * 100.0 <= InpMinMarginLevel))
+// Absolute equity floor (not subject to % distortion).
+   if(InpMinEquity > 0.0 && AccountEquity() <= InpMinEquity)
+     {
+      TriggerRiskStop("equity floor", InpCloseAllOnDDStop);
+      return(true);
+     }
+// Absolute basket floating-loss money stop (not %-dependent).
+   if(InpMaxBasketLossMoney > 0.0 && (g_buyCount + g_sellCount) > 0 && g_ownFloatingPL <= -InpMaxBasketLossMoney)
+     {
+      TriggerRiskStop("basket money stop", InpCloseAllOnDDStop);
+      return(true);
+     }
+// Margin level floor.
+   if(InpMinMarginLevel > 0.0 && AccountMargin() > 0.0 &&
+      (AccountEquity() / AccountMargin() * 100.0) <= InpMinMarginLevel)
      {
       TriggerRiskStop("margin level breach", true);
       return(true);
@@ -1009,7 +1136,7 @@ bool CheckRiskStops()
    UpdateHistoryState(false);
    if(InpMaxSessionDDPct > 0.0 && g_sessionDDPct >= InpMaxSessionDDPct)
      {
-      TriggerRiskStop("session DD breach", true);
+      TriggerRiskStop("session DD breach", InpCloseAllOnDDStop);
       return(true);
      }
    if(InpMaxDrawdownPct <= 0.0)
@@ -1017,7 +1144,9 @@ bool CheckRiskStops()
    double balance = AccountBalance();
    if(balance <= 0.0)
       return(false);
-   double dd = (InpDDMode == DD_EA_FLOATING) ? MathMax(0.0, -g_ownFloatingPL / balance * 100.0) : MathMax(0.0, (balance - AccountEquity()) / balance * 100.0);
+   double dd = (InpDDMode == DD_EA_FLOATING)
+               ? MathMax(0.0, -g_ownFloatingPL / balance * 100.0)
+               : MathMax(0.0, (balance - AccountEquity()) / balance * 100.0);
    if(dd >= InpMaxDrawdownPct)
      {
       TriggerRiskStop("drawdown breach", InpCloseAllOnDDStop);
@@ -1026,25 +1155,17 @@ bool CheckRiskStops()
    return(false);
   }
 
-//+------------------------------------------------------------------+
-//|                                                                  |
-//+------------------------------------------------------------------+
+// Non-blocking: set FSM state + latch-after-close flag; the tick/timer
+// loop performs the incremental close and then latches. If no orders to
+// close, latch immediately.
 void TriggerRiskStop(string reason, bool closeOrders)
   {
    g_stateReason = reason;
-   if(closeOrders && g_buyCount + g_sellCount > 0)
+   LogTrade("RISKSTOP", 0, 0.0, 0.0, 0.0, 0.0, reason);
+   if(closeOrders && (g_buyCount + g_sellCount) > 0)
      {
       g_latchAfterClose = true;
       g_state = EA_CLOSE_ALL_PENDING;
-      if(CloseAllOwnOrdersPass())
-        {
-         RefreshCache();
-         if(g_buyCount + g_sellCount == 0)
-           {
-            FinalizeBasket();
-            LatchEquityStop(reason);
-           }
-        }
      }
    else
       LatchEquityStop(reason);
@@ -1053,6 +1174,10 @@ void TriggerRiskStop(string reason, bool closeOrders)
 //+------------------------------------------------------------------+
 //| Safe trade operations                                            |
 //+------------------------------------------------------------------+
+// Returns a ticket > 0 ONLY when the position carries a real broker SL
+// (or broker SL is not required and protection was attached). On any
+// protection failure it reverts the fill and/or faults - it never
+// returns a live ticket as success while the EA is in PROTECTION_FAULT.
 int SafeOrderSend(int cmd, double lot, string comment)
   {
    if(!g_atrValid || !IsTradeContextUsable() || lot <= 0.0 || !ExposureAllows(lot, cmd))
@@ -1067,20 +1192,46 @@ int SafeOrderSend(int cmd, double lot, string comment)
 
    int ticket = SendMarketAttempt(cmd, lot, sl, tp, comment);
    if(ticket > 0)
-      return(ticket);
-   if(ticket != -2)
-      return(-1);
-
-   ticket = SendMarketAttempt(cmd, lot, 0.0, 0.0, comment);
-   if(ticket <= 0 || !SafeOrderModify(ticket, sl, tp))
      {
-      if(OrderSelect(ticket, SELECT_BY_TICKET) && SafeOrderClose(ticket, OrderLots()))
-         return(-1);
-      g_state = EA_PROTECTION_FAULT;
-      Alert("Unprotected order ", ticket);
+      LogTrade("OPEN", ticket, lot, entry, sl, tp, (cmd == OP_BUY ? "buy" : "sell") + " open");
       return(ticket);
      }
-   return(ticket);
+// -2 => ERR_INVALID_STOPS; -1 => other failure. With broker SL
+// required, never open an unprotected position.
+   if(InpRequireBrokerSL || ticket != -2)
+      return(-1);
+
+// Legacy fallback (broker SL not required): open naked then attach.
+   ticket = SendMarketAttempt(cmd, lot, 0.0, 0.0, comment);
+   if(ticket <= 0)
+      return(-1);
+   if(SafeOrderModify(ticket, sl, tp))
+     {
+      double op = (OrderSelect(ticket, SELECT_BY_TICKET) ? OrderOpenPrice() : entry);
+      LogTrade("OPEN", ticket, lot, op, sl, tp, "open fallback-modify");
+      return(ticket);
+     }
+// Could not attach protection -> try to revert the unprotected fill.
+   if(OrderSelect(ticket, SELECT_BY_TICKET) && SafeOrderClose(ticket, OrderLots()))
+     {
+      double cp = (OrderType() == OP_BUY) ? Bid : Ask;
+      LogTrade("CLOSE-FAILSAFE", ticket, lot, cp, 0.0, 0.0, "unprotected open reverted");
+      return(-1);
+     }
+// Last resort: push a conformed real broker stop so it is never naked.
+   double fSL = sl, fTP = tp;
+   ConformStops(cmd, fSL, fTP);
+   if(fSL > 0.0 && SafeOrderModify(ticket, fSL, fTP))
+     {
+      double op = (OrderSelect(ticket, SELECT_BY_TICKET) ? OrderOpenPrice() : entry);
+      LogTrade("OPEN", ticket, lot, op, fSL, fTP, "open last-resort stop");
+      return(ticket);
+     }
+// Cannot protect -> fault; OnTick/OnTimer will force close-all + latch.
+   g_state = EA_PROTECTION_FAULT;
+   g_stateReason = "unprotected order " + IntegerToString(ticket);
+   Alert("HOKKY V4: unprotected order ", ticket, " - entering protection fault");
+   return(-1);
   }
 
 //+------------------------------------------------------------------+
@@ -1095,7 +1246,8 @@ int SendMarketAttempt(int cmd, double lot, double sl, double tp, string comment)
       RefreshRates();
       double price = (cmd == OP_BUY) ? Ask : Bid;
       ResetLastError();
-      int ticket = OrderSend(Symbol(), cmd, lot, price, InpSlippage, NormalizePrice(sl), NormalizePrice(tp), comment, g_magic, 0, (cmd == OP_BUY) ? clrBlue : clrRed);
+      int ticket = OrderSend(Symbol(), cmd, lot, price, InpSlippage, NormalizePrice(sl), NormalizePrice(tp),
+                             comment, g_magic, 0, (cmd == OP_BUY) ? clrBlue : clrRed);
       if(ticket > 0)
          return(ticket);
       int err = GetLastError();
@@ -1115,7 +1267,8 @@ bool SafeOrderModify(int ticket, double newSL, double newTP)
   {
    for(int attempt = 0; attempt < 3; attempt++)
      {
-      if(!OrderSelect(ticket, SELECT_BY_TICKET) || OrderCloseTime() > 0 || OrderSymbol() != Symbol() || OrderMagicNumber() != g_magic || !IsTradeContextUsable())
+      if(!OrderSelect(ticket, SELECT_BY_TICKET) || OrderCloseTime() > 0 || OrderSymbol() != Symbol() ||
+         OrderMagicNumber() != g_magic || !IsTradeContextUsable())
          return(false);
       int cmd = OrderType();
       double sl = newSL, tp = newTP;
@@ -1133,19 +1286,9 @@ bool SafeOrderModify(int ticket, double newSL, double newTP)
         {
          double pad = (attempt + 1) * 2.0 * Point;
          if(cmd == OP_BUY)
-           {
-            if(newSL > 0.0)
-               newSL -= pad;
-            if(newTP > 0.0)
-               newTP += pad;
-           }
+           { if(newSL > 0.0) newSL -= pad; if(newTP > 0.0) newTP += pad; }
          else
-           {
-            if(newSL > 0.0)
-               newSL += pad;
-            if(newTP > 0.0)
-               newTP -= pad;
-           }
+           { if(newSL > 0.0) newSL += pad; if(newTP > 0.0) newTP -= pad; }
         }
       else
          if(!IsTransientTradeError(err))
@@ -1162,13 +1305,17 @@ bool SafeOrderClose(int ticket, double lots)
   {
    for(int attempt = 0; attempt < 3; attempt++)
      {
-      if(!OrderSelect(ticket, SELECT_BY_TICKET) || OrderCloseTime() > 0 || OrderSymbol() != Symbol() || OrderMagicNumber() != g_magic || !IsTradeContextUsable())
+      if(!OrderSelect(ticket, SELECT_BY_TICKET) || OrderCloseTime() > 0 || OrderSymbol() != Symbol() ||
+         OrderMagicNumber() != g_magic || !IsTradeContextUsable())
          return(false);
       RefreshRates();
       double price = (OrderType() == OP_BUY) ? Bid : Ask;
       ResetLastError();
       if(OrderClose(ticket, lots, price, InpSlippage, clrYellow))
+        {
+         LogTrade("CLOSE", ticket, lots, price, 0.0, 0.0, "logical close");
          return(true);
+        }
       if(!IsTransientTradeError(GetLastError()))
          return(false);
       Sleep(50 + attempt * 50);
@@ -1176,38 +1323,31 @@ bool SafeOrderClose(int ticket, double lots)
    return(false);
   }
 
-//+------------------------------------------------------------------+
-//|                                                                  |
-//+------------------------------------------------------------------+
+// Single non-blocking pass over open orders. Driven by the tick/timer
+// FSM; callers do NOT loop+sleep inline, so the tick thread is never
+// blocked by a long synchronous close.
 bool CloseAllOwnOrdersPass()
   {
    if(!IsTradeContextUsable())
       return(false);
-   for(int pass = 0; pass < 3; pass++)
+   RefreshRates();
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
      {
-      RefreshRates();
-      for(int i = OrdersTotal() - 1; i >= 0; i--)
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES) || OrderSymbol() != Symbol() || OrderMagicNumber() != g_magic)
+         continue;
+      int type = OrderType();
+      if(type != OP_BUY && type != OP_SELL)
+         continue;
+      double price = (type == OP_BUY) ? Bid : Ask;
+      ResetLastError();
+      if(!OrderClose(OrderTicket(), OrderLots(), price, InpSlippage, clrYellow))
         {
-         if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES) || OrderSymbol() != Symbol() || OrderMagicNumber() != g_magic)
-            continue;
-         int type = OrderType();
-         if(type != OP_BUY && type != OP_SELL)
-            continue;
-         double price = (type == OP_BUY) ? Bid : Ask;
-         ResetLastError();
-
-         if(!OrderClose(OrderTicket(), OrderLots(), price, InpSlippage, clrYellow))
-           {
-            int err = GetLastError();
-            if(!IsTransientTradeError(err))
-               Print("CloseAll failed. Ticket=", OrderTicket(), " error=", err);
-           }
+         int err = GetLastError();
+         if(!IsTransientTradeError(err))
+            Print("CloseAll failed. Ticket=", OrderTicket(), " error=", err);
         }
-      RefreshCache();
-      if(g_buyCount + g_sellCount == 0)
-         return(true);
-      if(pass < 2)
-         Sleep(120);
+      else
+         LogTrade("CLOSE", OrderTicket(), OrderLots(), price, 0.0, 0.0, "close-all pass");
      }
    RefreshCache();
    return(g_buyCount + g_sellCount == 0);
@@ -1253,8 +1393,9 @@ bool IsTransientTradeError(int err)
 //+------------------------------------------------------------------+
 bool IsWithinTradingHours()
   {
+// Equal start/end means 24h (fixes the silent zero-trade foot-gun).
    if(InpStartTrade == InpEndTrade)
-      return(false);
+      return(true);
    int hour = TimeHour(TimeCurrent());
    if(InpStartTrade < InpEndTrade)
       return(hour >= InpStartTrade && hour < InpEndTrade);
@@ -1335,10 +1476,19 @@ int GenerateMagicNumber(string seed)
    return(magic <= 0 ? 100000 + (MathAbs(magic) % 100000000) : magic);
   }
 
-void WarnThrottled(string text) { if(TimeCurrent() - g_lastWarning < 300) return; g_lastWarning = TimeCurrent(); Print("WARN: ", text); }
-
 //+------------------------------------------------------------------+
 //|                                                                  |
+//+------------------------------------------------------------------+
+void WarnThrottled(string text)
+  {
+   if(TimeCurrent() - g_lastWarning < 300)
+      return;
+   g_lastWarning = TimeCurrent();
+   Print("WARN: ", text);
+  }
+
+//+------------------------------------------------------------------+
+//| CSV trade journal (now wired into trade paths)                  |
 //+------------------------------------------------------------------+
 void LogTrade(string action, int ticket, double lots, double price, double sl, double tp, string note)
   {
@@ -1357,7 +1507,7 @@ void LogTrade(string action, int ticket, double lots, double price, double sl, d
   }
 
 //+------------------------------------------------------------------+
-//|                                                                  |
+//| Entry filters                                                    |
 //+------------------------------------------------------------------+
 bool IsTrendAligned(int cmd)
   {
@@ -1381,7 +1531,7 @@ bool IsTrendAligned(int cmd)
   }
 
 //+------------------------------------------------------------------+
-//|                                                                  |
+//| Persistent-state touch (keeps GVs from expiring)                 |
 //+------------------------------------------------------------------+
 void TouchPersistentState()
   {
@@ -1400,7 +1550,13 @@ void TouchPersistentState()
 //+------------------------------------------------------------------+
 //| Dashboard                                                        |
 //+------------------------------------------------------------------+
-void UpdateDashboardThrottled() { if(!InpUseDashboard || TimeCurrent() - g_lastDashboard < 1) return; g_lastDashboard = TimeCurrent(); UpdateDashboard(); }
+void UpdateDashboardThrottled()
+  {
+   if(!InpUseDashboard || TimeCurrent() - g_lastDashboard < 1)
+      return;
+   g_lastDashboard = TimeCurrent();
+   UpdateDashboard();
+  }
 
 //+------------------------------------------------------------------+
 //|                                                                  |
@@ -1453,18 +1609,21 @@ void UpdateDashboard()
    if(!InpUseDashboard)
       return;
    int x = 12, y = 22, dy = 15, line = 0;
-   color stateClr = (g_state == EA_RUNNING) ? clrLime : (g_state == EA_WAIT_ATR ? clrYellow : (g_state == EA_CLOSE_ALL_PENDING ? clrOrange : clrRed));
+   color stateClr = (g_state == EA_RUNNING) ? clrLime :
+                    (g_state == EA_WAIT_ATR ? clrYellow :
+                     (g_state == EA_CLOSE_ALL_PENDING ? clrOrange : clrRed));
    double marginLevel = (AccountMargin() > 0.0) ? AccountEquity() / AccountMargin() * 100.0 : 0.0;
-   SetLabel("00", x, y + dy*line++, "HOKKY V4.22 ATR | Magic " + IntegerToString(g_magic) + " | " + Symbol() + " M" + IntegerToString(Period()), clrWhite, 9);
+   SetLabel("00", x, y + dy*line++, "HOKKY V4.30 ATR | Magic " + IntegerToString(g_magic) + " | " + Symbol() + " M" + IntegerToString(Period()), clrWhite, 9);
    SetLabel("01", x, y + dy*line++, "State: " + StateText(g_state) + " - " + g_stateReason, stateClr, 9);
    SetLabel("02", x, y + dy*line++, "ATR(" + IntegerToString(InpATRPeriod) + "): " + (g_atrValid ? DoubleToString(g_atr, Digits) : "INVALID") + " spread: " + DoubleToString(CurrentSpreadPoints(), 1), clrSilver, 9);
    SetLabel("03", x, y + dy*line++, "BUY  n=" + IntegerToString(g_buyCount) + " lots=" + DoubleToString(g_buyLots, 2) + " avg=" + DoubleToString(g_buyAvg, Digits), clrDodgerBlue, 9);
    SetLabel("04", x, y + dy*line++, "SELL n=" + IntegerToString(g_sellCount) + " lots=" + DoubleToString(g_sellLots, 2) + " avg=" + DoubleToString(g_sellAvg, Digits), clrTomato, 9);
    SetLabel("05", x, y + dy*line++, "Float P/L: " + DoubleToString(g_ownFloatingPL, 2) + " basket #" + IntegerToString(g_basketId) + (g_basketActive ? " active" : " idle"), clrSilver, 9);
-   SetLabel("06", x, y + dy*line++, "Session DD: " + DoubleToString(g_sessionDDPct, 2) + "% / " + DoubleToString(InpMaxSessionDDPct, 1) + "%", (g_sessionDDPct > 0.7 * InpMaxSessionDDPct ? clrOrange : clrSilver), 9);
+   SetLabel("06", x, y + dy*line++, "Session DD: " + DoubleToString(g_sessionDDPct, 2) + "% / " + DoubleToString(InpMaxSessionDDPct, 1) + "%  DD: " + DoubleToString(InpMaxDrawdownPct, 1) + "%", (g_sessionDDPct > 0.7 * InpMaxSessionDDPct ? clrOrange : clrSilver), 9);
    SetLabel("07", x, y + dy*line++, "Margin: " + (marginLevel > 0.0 ? DoubleToString(marginLevel, 1) + "%" : "n/a") + " free: " + DoubleToString(AccountFreeMargin(), 2), clrSilver, 9);
-   SetLabel("08", x, y + dy*line++, "Next lot: " + DoubleToString(g_nextRecoveryLot, 2) + " latch: " + (IsEquityStopLatched() ? "ACTIVE" : "clear"), IsEquityStopLatched() ? clrRed : clrSilver, 9);
-   SetLabel("09", x, y + dy*line++, "Not financial advice - demo-test before live use.", clrGray, 8);
+   SetLabel("08", x, y + dy*line++, "Next lot: " + DoubleToString(g_nextRecoveryLot, 2) + " mult: " + DoubleToString(InpMultiplier, 2) + " maxLvl: " + IntegerToString(InpMaxLevel) + (InpHaltAddonsWhenCapped ? " haltCap" : ""), clrSilver, 9);
+   SetLabel("09", x, y + dy*line++, "Risk guards: " + (InpRequireBrokerSL ? "brokerSL " : "") + (InpMinEquity > 0 ? "eqFloor " : "") + (InpMaxBasketLossMoney > 0 ? "moneyStop " : "") + "latch: " + (IsEquityStopLatched() ? "ACTIVE" : "clear"), IsEquityStopLatched() ? clrRed : clrSilver, 9);
+   SetLabel("10", x, y + dy*line++, "Not financial advice - demo-test before live use.", clrGray, 8);
    ChartRedraw();
   }
 
