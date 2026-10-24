@@ -112,9 +112,9 @@ input bool                InpADXUseDI             = true;
 
 input bool                InpUseTrendFilter       = true;
 input bool                InpTrendFilterAddons    = true;
-input int                 InpTrendMA_Period       = 50;
+input int                 InpTrendMA_Period       = 9;
 input ENUM_MA_METHOD      InpTrendMA_Method       = MODE_EMA;
-input ENUM_TIMEFRAMES     InpTrendTimeframe       = PERIOD_H1;
+input ENUM_TIMEFRAMES     InpTrendTimeframe       = PERIOD_M1;
 
 input bool                InpUseQuietHours        = true;
 input int                 InpQuietStartHour       = 23;
@@ -142,6 +142,7 @@ input string              InpJournalFile          = "HOKKY_V7_trades.csv";
 #define K_SPEAK     "SPEAK"
 #define K_LASTCMD   "LASTCMD"
 #define K_LASTDIR   "LASTDIR"
+#define K_LASTDIR_SHARED "LASTDIRS"
 #define K_EQSTOP    "EQSTOP"
 #define K_EQTIME    "EQTIME"
 #define K_EQWHY     "EQWHY"
@@ -255,6 +256,7 @@ datetime   g_lastDashboard = 0, g_lastTrailLog = 0, g_nettingAlertTime = 0;
 string     g_objPrefix = "";
 int        g_journalHandle = INVALID_HANDLE;
 datetime   g_lastJournalFlush = 0;
+string     g_sharedLastDirGV = "";
 
 //====================================================================
 // EVENT HANDLERS
@@ -315,6 +317,7 @@ int OnInit()
          PurgeRiskState(b3);
          LoadPersistentState(b3);
         }
+      PurgeSharedState(); // Patch 2b: once, not per-book
      }
 
    for(int b4 = 0; b4 < BOOK_COUNT; b4++)
@@ -683,6 +686,8 @@ void BuildPersistentNames()
       g_bookComment[b] = BookComment(b);
      }
    g_objPrefix = "A" + IntegerToString(g_bk[BOOK_CLASSIC].magic) + "_";
+   string sharedRoot = HOKKY_GV_ROOT + acct + "_" + srv + "_" + sym + "_SHARED_";
+   g_sharedLastDirGV = sharedRoot + K_LASTDIR_SHARED;
   }
 
 //====================================================================
@@ -834,6 +839,17 @@ void PurgeRiskState(int book)
   }
 
 //+------------------------------------------------------------------+
+//| Delete the cross-book shared gate. Called ONCE per purge, not    |
+//| once per book, because the GV is shared by both books.           |
+//+------------------------------------------------------------------+
+void PurgeSharedState()
+  {
+   if(g_sharedLastDirGV != "" && GlobalVariableCheck(g_sharedLastDirGV))
+      GlobalVariableDel(g_sharedLastDirGV);
+   GlobalVariablesFlush();
+  }
+
+//+------------------------------------------------------------------+
 //|                                                                  |
 //+------------------------------------------------------------------+
 bool ApplyStateCommand(int book)
@@ -862,6 +878,7 @@ bool ApplyStateCommand(int book)
      {
       GlobalVariableSet(p + K_LASTDIR, 0.0);
       g_bk[book].lastInitDirection = 0;
+      PurgeSharedState(); // Patch 2c: centralised
      }
    GlobalVariableSet(p + K_LASTCMD, (double)InpStateCommandId);
    GlobalVariablesFlush();
@@ -951,6 +968,8 @@ void TouchPersistentState()
    for(int tb2 = 0; tb2 < BOOK_COUNT; tb2++)
       if(g_magicGV[tb2] != "")
          GlobalVariableSet(g_magicGV[tb2], (double)g_bk[tb2].magic);
+   if(g_sharedLastDirGV != "" && GlobalVariableCheck(g_sharedLastDirGV))
+      GlobalVariableSet(g_sharedLastDirGV, GlobalVariableGet(g_sharedLastDirGV));
   }
 
 //====================================================================
@@ -976,44 +995,60 @@ double MaxOrderLotForBook(int book)
 //+------------------------------------------------------------------+
 double PerOrderCap(int book)
   { if(InpDbLots == LOT_RECOVERY) return(InpMaxRecoveryLot); return(MaxOrderLotForBook(book)); }
-//+------------------------------------------------------------------+
-//| Direction of the most recent basket's L0 (initial) order.        |
-//| Returns OP_BUY / OP_SELL / 0 (unknown - no prior basket yet).    |
-//| Falls back to the currently-open L0 when the GV is missing.      |
-//+------------------------------------------------------------------+
-int LastInitDirectionForBook(int book)
-  {
-   if(g_bk[book].lastInitDirection != 0)
-      return(g_bk[book].lastInitDirection);
 
-   int derived = 0;
-   for(int i = 0; i < g_bk[book].buyCount; i++)
+//+------------------------------------------------------------------+
+//| Shared last-init-direction gate (CROSS-BOOK).                    |
+//| The next L0 opened in EITHER book must be the OPPOSITE of the    |
+//| last L0 opened in EITHER book. Returns OP_BUY / OP_SELL / 0      |
+//| (0 = unknown, no constraint yet).                                |
+//| Falls back to an open L0 in either book when the GV is missing.  |
+//+------------------------------------------------------------------+
+int GetSharedLastInitDirection()
+  {
+   if(g_sharedLastDirGV != "" && GlobalVariableCheck(g_sharedLastDirGV))
      {
-      COrderData ob = BookBuy(book, i);
-      if(ob.ticket > 0 && ob.level == 0)
-        {
-         derived = OP_BUY;
-         break;
-        }
+      int d = (int)GlobalVariableGet(g_sharedLastDirGV);
+      if(d == OP_BUY || d == OP_SELL)
+         return(d);
      }
-   if(derived == 0)
-      for(int j = 0; j < g_bk[book].sellCount; j++)
+   for(int b = 0; b < BOOK_COUNT; b++)
+     {
+      for(int i = 0; i < g_bk[b].buyCount; i++)
         {
-         COrderData os = BookSell(book, j);
-         if(os.ticket > 0 && os.level == 0)
+         COrderData ob = BookBuy(b, i);
+         if(ob.ticket > 0 && ob.level == 0)
            {
-            derived = OP_SELL;
-            break;
+            if(g_sharedLastDirGV != "")
+              { GlobalVariableSet(g_sharedLastDirGV, (double)OP_BUY); GlobalVariablesFlush(); }
+            return(OP_BUY);
            }
         }
-
-   if(derived != 0)
-     {
-      g_bk[book].lastInitDirection = derived;
-      GlobalVariableSet(g_prefix[book] + K_LASTDIR, (double)derived);
+      for(int j = 0; j < g_bk[b].sellCount; j++)
+        {
+         COrderData os = BookSell(b, j);
+         if(os.ticket > 0 && os.level == 0)
+           {
+            if(g_sharedLastDirGV != "")
+              { GlobalVariableSet(g_sharedLastDirGV, (double)OP_SELL); GlobalVariablesFlush(); }
+            return(OP_SELL);
+           }
+        }
      }
-   return(derived);
+   return(0);
   }
+
+//+------------------------------------------------------------------+
+void SetSharedLastInitDirection(int dir)
+  {
+   if(dir != OP_BUY && dir != OP_SELL)
+      return;
+   if(g_sharedLastDirGV != "")
+     {
+      GlobalVariableSet(g_sharedLastDirGV, (double)dir);
+      GlobalVariablesFlush();
+     }
+  }
+
 int CountOwnOrders(int book) { return(g_bk[book].buyCount + g_bk[book].sellCount); }
 
 //====================================================================
@@ -1707,15 +1742,15 @@ void OpenInitialTrade(int book)
    if(InpUseTrendFilter && !IsTrendAligned(cmd))
       return;
 
-// --- Alternating initial-direction gate (per book) -----------------
-// If the previous basket's L0 was BUY, only SELL may open now, and vice versa.
-   int prevDir = LastInitDirectionForBook(book);
+// --- Alternating initial-direction gate (CROSS-BOOK) ---------------
+// The next L0 in EITHER book must be the OPPOSITE of the last L0 in EITHER book.
+   int prevDir = GetSharedLastInitDirection();
    if(prevDir != 0 && cmd == prevDir)
      {
-      WarnThrottled(book, "new basket blocked: previous L0 was " +
+      WarnThrottled(book, "new basket blocked: shared last L0 was " +
                     (prevDir == OP_BUY ? "BUY" : "SELL") +
-                    " - alternating rule requires " +
-                    (prevDir == OP_BUY ? "SELL" : "BUY") + " for the next L0.");
+                    " - next L0 in either book must be " +
+                    (prevDir == OP_BUY ? "SELL" : "BUY") + ".");
       return;
      }
 
@@ -1727,6 +1762,7 @@ void OpenInitialTrade(int book)
       g_bk[book].initialTrades++;
       g_bk[book].lastInitDirection = cmd;
       GlobalVariableSet(g_prefix[book] + K_LASTDIR, (double)cmd);
+      SetSharedLastInitDirection(cmd);
       MarkCacheDirty(book);
       RefreshCache(book);
       g_bk[book].previousOpenCount = CountOwnOrders(book);
@@ -2429,6 +2465,7 @@ bool CloseAllOwnOrdersPass(int book)
          continue;
       if(target >= 0 && type != target)
          continue;
+      RefreshRates();                          // Patch 1: fresh Bid/Ask per iteration
       int    ticket = OrderTicket();
       double volume = OrderLots();
       double price  = (type == OP_BUY) ? Bid : Ask;
@@ -2795,6 +2832,12 @@ void UpdateDashboard()
             "  float " + DoubleToString(TotalAccountFloatingPL(), 2) +
             "  margin " + (marginLevel > 0.0 ? DoubleToString(marginLevel, 1) + "%" : "n/a"),
             clrSilver, 9);
+
+   int gateDir = GetSharedLastInitDirection();   // Patch 3: show the shared gate
+   SetLabel("23", x, y + dy * line++,
+            "GATE: next L0 must be " +
+            (gateDir == OP_BUY ? "SELL" : (gateDir == OP_SELL ? "BUY" : "either (open)")),
+            clrYellow, 8);
 
    SetLabel("21", x, y + dy * line++,
             "Guards: " + (InpRequireBrokerSL ? "brokerSL " : "") +
