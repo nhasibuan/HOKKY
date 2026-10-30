@@ -1034,7 +1034,7 @@ int GetSharedLastInitDirection()
            }
         }
      }
-   return(0);
+   return(-1);
   }
 
 //+------------------------------------------------------------------+
@@ -1745,7 +1745,7 @@ void OpenInitialTrade(int book)
 // --- Alternating initial-direction gate (CROSS-BOOK) ---------------
 // The next L0 in EITHER book must be the OPPOSITE of the last L0 in EITHER book.
    int prevDir = GetSharedLastInitDirection();
-   if(prevDir != 0 && cmd == prevDir)
+   if(prevDir != -1 && cmd == prevDir)
      {
       WarnThrottled(book, "new basket blocked: shared last L0 was " +
                     (prevDir == OP_BUY ? "BUY" : "SELL") +
