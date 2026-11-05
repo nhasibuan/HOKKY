@@ -1,15 +1,9 @@
 //+------------------------------------------------------------------+
-//|                                                      ProjectName |
-//|                                      Copyright 2018, CompanyName |
-//|                                       http://www.companyname.net |
-//+------------------------------------------------------------------+
-
-//+------------------------------------------------------------------+
 //|  EA_HOKKY_V8.mq4                                                 |
 //|  HOKKY V8.0 - Dual-engine ATR EA with Cross-Book Gate Fix        |
 //|  Complete build. Fixes OP_BUY=0 logic bug + all V7 hardening.    |
 //+------------------------------------------------------------------+
-#property copyright "HOKKY V8.0 CLEAN - from HOKKY V7.0"
+#property copyright "HOKKY V8.0 CLEAN"
 #property link      "https://github.com/nhasibuan/HOKKY"
 #property version   "8.00"
 #property description "Dual-engine ATR EA: fading martingale in ranging ADX, pendulum grid in trending ADX."
@@ -70,7 +64,7 @@ input double              InpHardSL_ATR           = 6.00;
 
 input ENUM_LOT_MODE       InpDbLots               = LOT_MULTIPLIER;
 input double              InpLots                 = 0.01;
-input double              InpMultiplier           = 1.60;
+input double              InpMultiplier           = 2.0;
 input int                 InpMaxLevel             = 8;
 input double              InpMaxOrderLot          = 1.00;
 input double              InpMaxTotalLots         = 5.00;
@@ -96,7 +90,7 @@ input double              InpTrailStartATR        = 1.00;
 input double              InpTrailDistanceATR     = 0.50;
 input int                 InpTrailStepPoints      = 20;
 
-input bool                InpUseBasketTP          = true;
+input bool                InpUseBasketTP          = false;
 input bool                InpUseBasketSL          = true;
 input int                 InpMinModifyPoints      = 10;
 
@@ -133,7 +127,7 @@ input string              InpJournalFile          = "HOKKY_V8_trades.csv";
 //====================================================================
 // CONSTANTS
 //====================================================================
-#define HOKKY_STATE_SCHEMA      8.1 // Bumped from 8.0
+#define HOKKY_STATE_SCHEMA      8.1
 #define HOKKY_ID_TAG            "HOKKY_V80"
 #define HOKKY_GV_ROOT           "A"
 #define HOKKY_GV_MAGIC          "A"
@@ -203,6 +197,7 @@ struct CBookState
    bool              basketActive;
    double            basketRealized;
    double            nextRecoveryLot;
+   int               activeBasketLevel; // NEW: Tracks true grid level
 
    datetime          sessionStart;
    double            sessionBaseBalance;
@@ -266,6 +261,126 @@ datetime   g_lastJournalFlush = 0;
 string     g_sharedLastDirGV = "";
 
 //====================================================================
+// FORWARD DECLARATIONS
+//====================================================================
+bool InitArrayBuffers();
+int InitFail(string text);
+bool InitError(string text);
+bool ValidateInputs();
+void AuditRiskConfiguration();
+bool ResolveMagics();
+int DeriveAutoMagic(string acct, string srv, string sym, int book);
+string BookTag(int book);
+string BookName(int book);
+string BookComment(int book);
+void BuildPersistentNames();
+bool AcquireInstanceLeases();
+void ReleaseLease(int book);
+void ReleaseInstanceLeases();
+void UpdateHeartbeat();
+void LoadPersistentState(int book);
+void EnsureGV(int book, string key, double value);
+void PurgeRiskState(int book);
+void PurgeSharedState();
+bool ApplyStateCommand(int book);
+void ResetSessionState(int book);
+bool IsEquityStopLatched(int book);
+void LatchEquityStop(int book, string reason);
+void CheckLatchRelease(int book);
+void TouchPersistentState();
+double BaseLotsForBook(int book);
+int MaxLevelForBook(int book);
+double MaxOrderLotForBook(int book);
+double PerOrderCap(int book);
+int GetSharedLastInitDirection();
+void SetSharedLastInitDirection(int dir);
+int CountOwnOrders(int book);
+int BookBuySize(int book);
+int BookSellSize(int book);
+void BookClearOrders(int book);
+void BookAppendBuy(int book, const COrderData &rec);
+void BookAppendSell(int book, const COrderData &rec);
+COrderData BookBuy(int book, int idx);
+COrderData BookSell(int book, int idx);
+void BookSeenClear(int book);
+bool BookSeenHas(int book, int ticket);
+void BookSeenAdd(int book, int ticket);
+void RefreshCache(int book);
+void MarkCacheDirty(int book);
+double TotalAccountFloatingPL();
+double TotalAccountLots();
+int TotalAccountOrders();
+bool IsNewer(datetime candidateTime, int candidateTicket, datetime savedTime, int savedTicket);
+int ParseLevelFromComment(string comment);
+void RestoreOrCreateBasketState(int book);
+void StartNewBasket(int book);
+void SaveBasketState(int book);
+void InvalidateHistoryCache(int book);
+void MarkTicketSeen(int book, int ticket);
+bool IsTicketSeen(int book, int ticket);
+void UpdateHistoryState(int book, bool force);
+void RebuildRealizedState(int book);
+void RecomputeSessionDD(int book);
+void FinalizeBasket(int book);
+bool UpdateMarketState(bool force);
+double ATRDistance(double multiplier);
+bool RegimeAllowsClassic();
+bool RegimeAllowsPendulum();
+bool RegimeAllowsBook(int book);
+bool IsTrendAligned(int cmd);
+bool IsWithinTradingHours();
+bool IsQuietHour();
+double CurrentSpreadPoints();
+bool SpreadAcceptable();
+void ProcessTrading(int book);
+void ProcessClassicGrid(int book);
+void ProcessPendulumGrid(int book);
+void OpenInitialTrade(int book);
+void OpenAddonTrade(int book, int cmd);
+bool ExposureAllows(int book, double lot, int cmd);
+double CalculateRawLot(int book, int orderIndex);
+double CalculateLotSize(int book, int orderIndex);
+int EffectiveMaxLevel(int book);
+string BuildOrderComment(int book, int level);
+bool ManageLogicalExits(int book);
+void ApplyTrailingStops(int book);
+void TrailOne(int book, const COrderData &ord, double startDist, double trailDist, double stepPrice);
+void ApplyHedgeOffset(int book);
+void TriggerCloseSide(int book, int cmd, string reason);
+void TriggerCloseAll(int book, string reason);
+void ReconcileBrokerProtection(int book);
+bool ReconcileOne(int book, const COrderData &ord);
+bool CheckAccountRiskStops();
+bool CheckBookRiskStops(int book);
+void TriggerRiskStop(int book, string reason, bool closeOrders);
+void TriggerRiskStopAllBooks(string reason, bool closeOrders);
+void DriveCloseAllFSM(int book);
+int SafeOrderSend(int book, int cmd, double lot, string comment);
+void ProbeNetting(int book, int cmd, int ownBefore, int oppositeBefore);
+int SendMarketAttempt(int book, int cmd, double lot, double sl, double tp, string comment);
+bool SafeOrderModify(int book, int ticket, double newSL, double newTP);
+bool SafeOrderClose(int book, int ticket, double lots);
+bool CloseAllOwnOrdersPass(int book);
+bool IsTradeContextUsable();
+bool IsTransientTradeError(int err);
+void ConformStops(int cmd, double &sl, double &tp);
+double NormalizePrice(double price);
+int LotDigits(double lotStep);
+double NormalizeLotDown(double lot);
+int PositiveHash(string text);
+void WarnThrottled(int book, string text);
+void OpenJournal();
+void CloseJournal();
+void FlushJournal(bool force);
+void LogTrade(int book, string action, int ticket, double lots, double price, double sl, double tp, string note);
+void LogTradeThrottled(int book, string action, int ticket, double lots, double price, double sl, double tp, string note);
+void UpdateDashboardThrottled();
+string StateText(ENUM_EA_STATE s);
+void SetLabel(string id, int x, int y, string text, color clrText, int fontsize);
+void DeleteOwnObjects();
+void UpdateDashboard();
+
+//====================================================================
 // EVENT HANDLERS
 //====================================================================
 int OnInit()
@@ -285,6 +400,7 @@ int OnInit()
       g_bk[b].lastCacheRefresh = 0;
       g_bk[b].lastWarning      = 0;
       g_bk[b].lastInitDirection = DIR_NONE;
+      g_bk[b].activeBasketLevel = 0;
      }
 
    if(!g_bk[BOOK_CLASSIC].enabled && !g_bk[BOOK_PENDULUM].enabled)
@@ -377,6 +493,8 @@ int OnInit()
   }
 
 //+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
 void OnDeinit(const int reason)
   {
    EventKillTimer();
@@ -385,6 +503,8 @@ void OnDeinit(const int reason)
    DeleteOwnObjects();
   }
 
+//+------------------------------------------------------------------+
+//|                                                                  |
 //+------------------------------------------------------------------+
 void OnTimer()
   {
@@ -406,6 +526,8 @@ void OnTimer()
   }
 
 //+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
 void OnTick()
   {
    UpdateHeartbeat();
@@ -422,8 +544,7 @@ void OnTick()
      {
       if(!g_bk[b2].enabled)
          continue;
-      if(g_bk[b2].cacheDirty || newBar ||
-         TimeCurrent() - g_bk[b2].lastCacheRefresh >= CACHE_REFRESH_SEC)
+      if(g_bk[b2].cacheDirty || newBar || TimeCurrent() - g_bk[b2].lastCacheRefresh >= CACHE_REFRESH_SEC)
          RefreshCache(b2);
      }
 
@@ -487,8 +608,7 @@ void OnTick()
      {
       if(!g_bk[b7].enabled)
          continue;
-      if(g_bk[b7].state == EA_CLOSE_ALL_PENDING || g_bk[b7].state == EA_PROTECTION_FAULT ||
-         g_bk[b7].state == EA_DD_LATCHED)
+      if(g_bk[b7].state == EA_CLOSE_ALL_PENDING || g_bk[b7].state == EA_PROTECTION_FAULT || g_bk[b7].state == EA_DD_LATCHED)
          continue;
 
       if(b7 == BOOK_PENDULUM)
@@ -525,7 +645,7 @@ bool InitArrayBuffers()
   {
    if(ArrayResize(g_classicSeen, HISTORY_RING_MAX) < HISTORY_RING_MAX)
       return(false);
-   if(ArrayResize(g_pendSeen, HISTORY_RING_MAX)    < HISTORY_RING_MAX)
+   if(ArrayResize(g_pendSeen, HISTORY_RING_MAX) < HISTORY_RING_MAX)
       return(false);
    for(int i = 0; i < HISTORY_RING_MAX; i++)
      {
@@ -705,9 +825,9 @@ bool AcquireInstanceLeases()
       if(!GlobalVariableCheck(g_ownerGV[b]))
          GlobalVariableSet(g_ownerGV[b], 0.0);
       if(!GlobalVariableCheck(g_beatGV[b]))
-         GlobalVariableSet(g_beatGV[b],  0.0);
-      double   observed = GlobalVariableGet(g_ownerGV[b]);
-      datetime beat     = (datetime)GlobalVariableGet(g_beatGV[b]);
+         GlobalVariableSet(g_beatGV[b], 0.0);
+      double observed = GlobalVariableGet(g_ownerGV[b]);
+      datetime beat = (datetime)GlobalVariableGet(g_beatGV[b]);
       if(observed != 0.0 && (now - beat) < InpLeaseStaleSeconds)
         {
          for(int rl = 0; rl < b; rl++)
@@ -734,7 +854,7 @@ void ReleaseLease(int book)
   {
    if((int)GlobalVariableGet(g_ownerGV[book]) == g_ownerToken)
      {
-      GlobalVariableSet(g_beatGV[book],  0.0);
+      GlobalVariableSet(g_beatGV[book], 0.0);
       GlobalVariableSet(g_ownerGV[book], 0.0);
      }
   }
@@ -898,8 +1018,8 @@ void ResetSessionState(int book)
    g_bk[book].sessionPeakNet     = 0.0;
    g_bk[book].initialTrades      = 0;
    GlobalVariableSet(g_prefix[book] + K_SSTART, (double)g_bk[book].sessionStart);
-   GlobalVariableSet(g_prefix[book] + K_SBASE,  g_bk[book].sessionBaseBalance);
-   GlobalVariableSet(g_prefix[book] + K_SPEAK,  0.0);
+   GlobalVariableSet(g_prefix[book] + K_SBASE, g_bk[book].sessionBaseBalance);
+   GlobalVariableSet(g_prefix[book] + K_SPEAK, 0.0);
    InvalidateHistoryCache(book);
   }
 
@@ -980,15 +1100,11 @@ double BaseLotsForBook(int book) { double v = (book == BOOK_PENDULUM) ? InpPendu
 //|                                                                  |
 //+------------------------------------------------------------------+
 int MaxLevelForBook(int book) { int v = (book == BOOK_PENDULUM) ? InpPendulumMaxLevel : InpClassicMaxLevel; return(v > 0 ? v : InpMaxLevel); }
-//+------------------------------------------------------------------+
-//|                                                                  |
-//+------------------------------------------------------------------+
 double MaxOrderLotForBook(int book) { double v = (book == BOOK_PENDULUM) ? InpPendulumMaxOrderLot : InpClassicMaxOrderLot; return(v > 0.0 ? v : InpMaxOrderLot); }
 double PerOrderCap(int book) { if(InpDbLots == LOT_RECOVERY) return(InpMaxRecoveryLot); return(MaxOrderLotForBook(book)); }
 
 //+------------------------------------------------------------------+
-//| Shared last-init-direction gate (CROSS-BOOK).                    |
-//| Returns OP_BUY / OP_SELL / DIR_NONE (-1).                        |
+//|                                                                  |
 //+------------------------------------------------------------------+
 int GetSharedLastInitDirection()
   {
@@ -1264,20 +1380,18 @@ void RefreshCache(int book)
            { g_bk[book].sellNewestTime = rec.openTime; g_bk[book].sellNewestTicket = rec.ticket; g_bk[book].sellNewestPrice = rec.openPrice; g_bk[book].sellNewestLevel = rec.level; }
         }
      }
-   if(g_bk[book].buyLots  > 0.0)
-      g_bk[book].buyAvg  = NormalizeDouble(buyPV  / g_bk[book].buyLots,  Digits);
+   if(g_bk[book].buyLots > 0.0)
+      g_bk[book].buyAvg = NormalizeDouble(buyPV / g_bk[book].buyLots, Digits);
    if(g_bk[book].sellLots > 0.0)
       g_bk[book].sellAvg = NormalizeDouble(sellPV / g_bk[book].sellLots, Digits);
-
    g_bk[book].cacheDirty = false;
    g_bk[book].lastCacheRefresh = TimeCurrent();
   }
 
-void MarkCacheDirty(int book) { g_bk[book].cacheDirty = true; }
-
 //+------------------------------------------------------------------+
 //|                                                                  |
 //+------------------------------------------------------------------+
+void MarkCacheDirty(int book) { g_bk[book].cacheDirty = true; }
 double TotalAccountFloatingPL() { return(g_bk[BOOK_CLASSIC].floatingPL + g_bk[BOOK_PENDULUM].floatingPL); }
 //+------------------------------------------------------------------+
 //|                                                                  |
@@ -1334,9 +1448,10 @@ void RestoreOrCreateBasketState(int book)
 void StartNewBasket(int book)
   {
    g_bk[book].basketId++;
-   g_bk[book].basketStart    = TimeCurrent();
-   g_bk[book].basketActive   = true;
+   g_bk[book].basketStart = TimeCurrent();
+   g_bk[book].basketActive = true;
    g_bk[book].basketRealized = 0.0;
+   g_bk[book].activeBasketLevel = 0;
    SaveBasketState(book);
   }
 
@@ -1418,9 +1533,9 @@ void UpdateHistoryState(int book, bool force)
       if(g_bk[book].basketActive && OrderOpenTime() >= g_bk[book].basketStart)
          g_bk[book].basketRealized += net;
      }
-   g_bk[book].lastHistoryTotal     = total;
+   g_bk[book].lastHistoryTotal = total;
    g_bk[book].lastHistoryScanCount = total;
-   g_bk[book].lastHistoryScan      = TimeCurrent();
+   g_bk[book].lastHistoryScan = TimeCurrent();
    RecomputeSessionDD(book);
   }
 
@@ -1452,9 +1567,9 @@ void RebuildRealizedState(int book)
       if(g_bk[book].basketActive && OrderOpenTime() >= g_bk[book].basketStart)
          g_bk[book].basketRealized += net;
      }
-   g_bk[book].lastHistoryTotal     = total;
+   g_bk[book].lastHistoryTotal = total;
    g_bk[book].lastHistoryScanCount = total;
-   g_bk[book].lastHistoryScan      = TimeCurrent();
+   g_bk[book].lastHistoryScan = TimeCurrent();
    RecomputeSessionDD(book);
   }
 
@@ -1492,9 +1607,9 @@ void FinalizeBasket(int book)
          g_bk[book].nextRecoveryLot = NormalizeLotDown(InpMaxRecoveryLot);
       GlobalVariableSet(g_prefix[book] + K_NEXTLOT, g_bk[book].nextRecoveryLot);
      }
-   g_bk[book].basketActive    = false;
-   g_bk[book].basketStart     = 0;
-   g_bk[book].basketRealized  = 0.0;
+   g_bk[book].basketActive = false;
+   g_bk[book].basketStart = 0;
+   g_bk[book].basketRealized = 0.0;
    SaveBasketState(book);
    InvalidateHistoryCache(book);
    g_bk[book].closeFailStreak = 0;
@@ -1540,7 +1655,7 @@ bool UpdateMarketState(bool force)
   }
 
 double ATRDistance(double multiplier) { return(!g_atrValid || multiplier <= 0.0 ? 0.0 : multiplier * g_atr); }
-bool RegimeAllowsClassic() { if(!InpUseADXRegime || !g_adxValid) return(true); return(g_adx <  InpADXThreshold); }
+bool RegimeAllowsClassic() { if(!InpUseADXRegime || !g_adxValid) return(true); return(g_adx < InpADXThreshold); }
 //+------------------------------------------------------------------+
 //|                                                                  |
 //+------------------------------------------------------------------+
@@ -1552,7 +1667,7 @@ bool RegimeAllowsBook(int book) { return(book == BOOK_PENDULUM ? RegimeAllowsPen
 //+------------------------------------------------------------------+
 bool IsTrendAligned(int cmd)
   {
-   double ma    = iMA(Symbol(), InpTrendTimeframe, InpTrendMA_Period, 0, InpTrendMA_Method, PRICE_CLOSE, 1);
+   double ma = iMA(Symbol(), InpTrendTimeframe, InpTrendMA_Period, 0, InpTrendMA_Method, PRICE_CLOSE, 1);
    double close = iClose(Symbol(), InpTrendTimeframe, 1);
    if(ma <= 0.0 || close <= 0.0)
       return(false);
@@ -1598,9 +1713,6 @@ bool IsQuietHour()
 //|                                                                  |
 //+------------------------------------------------------------------+
 double CurrentSpreadPoints() { return((Ask - Bid) / Point); }
-//+------------------------------------------------------------------+
-//|                                                                  |
-//+------------------------------------------------------------------+
 bool SpreadAcceptable()
   {
    double spread = CurrentSpreadPoints();
@@ -1626,8 +1738,6 @@ void ProcessTrading(int book)
       return;
    if(g_bk[book].initialTrades >= InpLoop)
       return;
-   if(!RegimeAllowsBook(book))
-      return;
    if(book == BOOK_PENDULUM && InpBlockOnNetting && g_bk[book].nettingDetected)
       return;
    if(!IsWithinTradingHours())
@@ -1638,14 +1748,21 @@ void ProcessTrading(int book)
       return;
 
    int own = CountOwnOrders(book);
+
+// 1. NEW BASKETS (L0): Must obey the ADX regime constraint
    if(own == 0)
      {
-      if(InpAllowNewBaskets)
+      if(InpAllowNewBaskets && RegimeAllowsBook(book))
          OpenInitialTrade(book);
       return;
      }
+
+// 2. EXISTING BASKETS (L1, L2, L3...):
+// Ignore the ADX regime constraint. The basket must be allowed to finish its grid
+// regardless of whether the market regime has changed since the L0 was opened.
    if(own >= MaxLevelForBook(book) || !InpAllowAddons)
       return;
+
    if(book == BOOK_PENDULUM)
       ProcessPendulumGrid(book);
    else
@@ -1662,15 +1779,29 @@ void ProcessClassicGrid(int book)
    double distance = ATRDistance(InpDistance);
    if(distance <= 0.0)
       return;
+
+   bool hitDistance = false;
+   int addonCmd = -1;
+
    if(g_bk[book].buyCount > 0 && g_bk[book].buyNewestPrice > 0.0 && (g_bk[book].buyNewestPrice - Ask) >= distance)
+     { hitDistance = true; addonCmd = OP_BUY; }
+   else
+      if(g_bk[book].sellCount > 0 && g_bk[book].sellNewestPrice > 0.0 && (Bid - g_bk[book].sellNewestPrice) >= distance)
+        { hitDistance = true; addonCmd = OP_SELL; }
+
+   if(hitDistance)
      {
-      if(!InpUseTrendFilter || !InpTrendFilterAddons || IsTrendAligned(OP_BUY))
-         OpenAddonTrade(book, OP_BUY);
-     }
-   if(g_bk[book].sellCount > 0 && g_bk[book].sellNewestPrice > 0.0 && (Bid - g_bk[book].sellNewestPrice) >= distance)
-     {
-      if(!InpUseTrendFilter || !InpTrendFilterAddons || IsTrendAligned(OP_SELL))
-         OpenAddonTrade(book, OP_SELL);
+      // REGIME FLIP CHECK: If ADX is now >= 20, trigger Pendulum L0
+      if(g_adxValid && g_adx >= InpADXThreshold)
+        {
+         if(InpAllowNewBaskets && CountOwnOrders(BOOK_PENDULUM) == 0)
+            OpenInitialTrade(BOOK_PENDULUM);
+         return;
+        }
+
+      // Normal Classic add-on
+      if(!InpUseTrendFilter || !InpTrendFilterAddons || IsTrendAligned(addonCmd))
+         OpenAddonTrade(book, addonCmd);
      }
   }
 
@@ -1684,25 +1815,39 @@ void ProcessPendulumGrid(int book)
    double distance = ATRDistance(InpDistance);
    if(distance <= 0.0)
       return;
+
    int newType = -1;
    double newPrice = 0.0;
+
    if(IsNewer(g_bk[book].buyNewestTime, g_bk[book].buyNewestTicket, g_bk[book].sellNewestTime, g_bk[book].sellNewestTicket))
-     { newType = OP_BUY;  newPrice = g_bk[book].buyNewestPrice;  }
+     { newType = OP_BUY; newPrice = g_bk[book].buyNewestPrice; }
    else
      { newType = OP_SELL; newPrice = g_bk[book].sellNewestPrice; }
+
    if(newType < 0 || newPrice <= 0.0)
       return;
+
+   bool hitDistance = false;
+   int addonCmd = -1;
+
    if(newType == OP_BUY)
-     {
-      if((newPrice - Ask) >= distance)
-         if(!InpUseTrendFilter || !InpTrendFilterAddons || IsTrendAligned(OP_SELL))
-            OpenAddonTrade(book, OP_SELL);
-     }
+     { if((newPrice - Ask) >= distance) { hitDistance = true; addonCmd = OP_SELL; } }
    else
+     { if((Bid - newPrice) >= distance) { hitDistance = true; addonCmd = OP_BUY; } }
+
+   if(hitDistance)
      {
-      if((Bid - newPrice) >= distance)
-         if(!InpUseTrendFilter || !InpTrendFilterAddons || IsTrendAligned(OP_BUY))
-            OpenAddonTrade(book, OP_BUY);
+      // REGIME FLIP CHECK: If ADX is now < 20, trigger Classic L0
+      if(g_adxValid && g_adx < InpADXThreshold)
+        {
+         if(InpAllowNewBaskets && CountOwnOrders(BOOK_CLASSIC) == 0)
+            OpenInitialTrade(BOOK_CLASSIC);
+         return;
+        }
+
+      // Normal Pendulum add-on
+      if(!InpUseTrendFilter || !InpTrendFilterAddons || IsTrendAligned(addonCmd))
+         OpenAddonTrade(book, addonCmd);
      }
   }
 
@@ -1719,17 +1864,16 @@ void OpenInitialTrade(int book)
    if(InpUseTrendFilter && !IsTrendAligned(cmd))
       return;
 
-// --- Alternating initial-direction gate (CROSS-BOOK) ---------------
    int prevDir = GetSharedLastInitDirection();
    if(prevDir != DIR_NONE && cmd == prevDir)
      {
-      WarnThrottled(book, "new basket blocked: shared last L0 was " + (prevDir == OP_BUY ? "BUY" : "SELL") + " - next L0 in either book must be " + (prevDir == OP_BUY ? "SELL" : "BUY") + ".");
+      WarnThrottled(book, "new basket blocked: shared last L0 was " + (prevDir == OP_BUY ? "BUY" : "SELL") + " - next L0 must be " + (prevDir == OP_BUY ? "SELL" : "BUY") + ".");
       return;
      }
 
    StartNewBasket(book);
-   double lot    = CalculateLotSize(book, 0);
-   int    ticket = SafeOrderSend(book, cmd, lot, BuildOrderComment(book, 0));
+   double lot = CalculateLotSize(book, 0);
+   int ticket = SafeOrderSend(book, cmd, lot, BuildOrderComment(book, 0));
    if(ticket > 0)
      {
       g_bk[book].initialTrades++;
@@ -1739,13 +1883,13 @@ void OpenInitialTrade(int book)
       MarkCacheDirty(book);
       RefreshCache(book);
       g_bk[book].previousOpenCount = CountOwnOrders(book);
-      g_bk[book].protectionDirty   = true;
+      g_bk[book].protectionDirty = true;
      }
    else
       if(CountOwnOrders(book) == 0)
         {
          g_bk[book].basketActive = false;
-         g_bk[book].basketStart  = 0;
+         g_bk[book].basketStart = 0;
          SaveBasketState(book);
         }
   }
@@ -1755,21 +1899,23 @@ void OpenInitialTrade(int book)
 //+------------------------------------------------------------------+
 void OpenAddonTrade(int book, int cmd)
   {
-   int level = CountOwnOrders(book);
+   g_bk[book].activeBasketLevel++;
+   int level = g_bk[book].activeBasketLevel;
+
+   if(level > MaxLevelForBook(book))
+      return;
+
    double lot = CalculateLotSize(book, level);
    if(InpHaltAddonsWhenCapped && level > 0)
      {
       double capLimit = PerOrderCap(book);
-      double rawLot   = CalculateRawLot(book, level);
-      bool   capClamped = (capLimit > 0.0 && rawLot >= capLimit - LOT_EPSILON);
+      double rawLot = CalculateRawLot(book, level);
+      bool capClamped = (capLimit > 0.0 && rawLot >= capLimit - LOT_EPSILON);
       if(capClamped)
         {
          double prevLot = CalculateLotSize(book, level - 1);
          if(lot <= prevLot + LOT_EPSILON)
-           {
-            WarnThrottled(book, "addon halted at level " + IntegerToString(level) + " - lot escalation is flat at " + DoubleToString(lot, 2) + " because the per-order cap is active.");
-            return;
-           }
+           { WarnThrottled(book, "addon halted at level " + IntegerToString(level) + " - lot escalation flat."); return; }
         }
      }
    int ticket = SafeOrderSend(book, cmd, lot, BuildOrderComment(book, level));
@@ -1778,7 +1924,7 @@ void OpenAddonTrade(int book, int cmd)
       MarkCacheDirty(book);
       RefreshCache(book);
       g_bk[book].previousOpenCount = CountOwnOrders(book);
-      g_bk[book].protectionDirty   = true;
+      g_bk[book].protectionDirty = true;
      }
   }
 
@@ -1851,9 +1997,7 @@ int EffectiveMaxLevel(int book)
 //|                                                                  |
 //+------------------------------------------------------------------+
 string BuildOrderComment(int book, int level)
-  {
-   return(g_bookComment[book] + "|B" + IntegerToString(g_bk[book].basketId) + "|L" + IntegerToString(level));
-  }
+  { return(g_bookComment[book] + "|B" + IntegerToString(g_bk[book].basketId) + "|L" + IntegerToString(level)); }
 
 //====================================================================
 // LOGICAL EXITS
@@ -1891,21 +2035,21 @@ bool ManageLogicalExits(int book)
         }
      }
 
-   bool   acted   = false;
-   double softSL  = ATRDistance(InpSL);
+   bool acted = false;
+   double softSL = ATRDistance(InpSL);
    double indivTP = ATRDistance(InpIndivTP);
-   double hardSL  = ATRDistance(InpHardSL_ATR);
-   int    nBuys   = g_bk[book].buyCount;
-   int    nSells  = g_bk[book].sellCount;
+   double hardSL = ATRDistance(InpHardSL_ATR);
+   int nBuys = g_bk[book].buyCount;
+   int nSells = g_bk[book].sellCount;
 
    for(int i = 0; i < nBuys; i++)
      {
       COrderData ob = BookBuy(book, i);
       if(ob.ticket == 0)
          continue;
-      bool bSoft = (softSL  > 0.0 && Bid <= (ob.openPrice - softSL));
-      bool bTP   = (indivTP > 0.0 && Bid >= (ob.openPrice + indivTP));
-      bool bHard = (hardSL  > 0.0 && Bid <= (ob.openPrice - hardSL));
+      bool bSoft = (softSL > 0.0 && Bid <= (ob.openPrice - softSL));
+      bool bTP = (indivTP > 0.0 && Bid >= (ob.openPrice + indivTP));
+      bool bHard = (hardSL > 0.0 && Bid <= (ob.openPrice - hardSL));
       if((bSoft || bTP || bHard) && SafeOrderClose(book, ob.ticket, ob.lots))
          acted = true;
      }
@@ -1914,9 +2058,9 @@ bool ManageLogicalExits(int book)
       COrderData os = BookSell(book, j);
       if(os.ticket == 0)
          continue;
-      bool sSoft = (softSL  > 0.0 && Ask >= (os.openPrice + softSL));
-      bool sTP   = (indivTP > 0.0 && Ask <= (os.openPrice - indivTP));
-      bool sHard = (hardSL  > 0.0 && Ask >= (os.openPrice + hardSL));
+      bool sSoft = (softSL > 0.0 && Ask >= (os.openPrice + softSL));
+      bool sTP = (indivTP > 0.0 && Ask <= (os.openPrice - indivTP));
+      bool sHard = (hardSL > 0.0 && Ask >= (os.openPrice + hardSL));
       if((sSoft || sTP || sHard) && SafeOrderClose(book, os.ticket, os.lots))
          acted = true;
      }
@@ -1959,14 +2103,14 @@ void ApplyTrailingStops(int book)
 //+------------------------------------------------------------------+
 void TrailOne(int book, const COrderData &ord, double startDist, double trailDist, double stepPrice)
   {
-   bool   isBuy  = (ord.type == OP_BUY);
+   bool isBuy = (ord.type == OP_BUY);
    double profit = isBuy ? (Bid - ord.openPrice) : (ord.openPrice - Ask);
    if(profit < startDist)
       return;
    double newSL = isBuy ? NormalizePrice(Bid - trailDist) : NormalizePrice(Ask + trailDist);
    if(newSL <= 0.0)
       return;
-   if(isBuy  && newSL <= ord.openPrice)
+   if(isBuy && newSL <= ord.openPrice)
       return;
    if(!isBuy && newSL >= ord.openPrice)
       return;
@@ -2001,14 +2145,14 @@ void ApplyHedgeOffset(int book)
    double balance = AccountBalance();
    if(balance <= 0.0)
       return;
-   double scale     = (InpHedgeOffsetSize == HEDGE_OFF_PCT) ? (balance / 100.0) : 1.0;
+   double scale = (InpHedgeOffsetSize == HEDGE_OFF_PCT) ? (balance / 100.0) : 1.0;
    double minProfit = InpHedgeOffsetMinProfit * scale;
-   double maxLoss   = InpHedgeOffsetMaxLoss   * scale;
+   double maxLoss = InpHedgeOffsetMaxLoss * scale;
 
-   bool buyLosing  = (g_bk[book].buyPL  <= -maxLoss);
+   bool buyLosing = (g_bk[book].buyPL <= -maxLoss);
    bool sellLosing = (g_bk[book].sellPL <= -maxLoss);
-   bool buyWin     = (g_bk[book].buyPL  >=  minProfit);
-   bool sellWin    = (g_bk[book].sellPL >=  minProfit);
+   bool buyWin = (g_bk[book].buyPL >= minProfit);
+   bool sellWin = (g_bk[book].sellPL >= minProfit);
 
    if(buyLosing && sellWin)
      {
@@ -2032,8 +2176,8 @@ void ApplyHedgeOffset(int book)
 void TriggerCloseSide(int book, int cmd, string reason)
   {
    g_bk[book].closeSidePending = cmd;
-   g_bk[book].state            = EA_CLOSE_ALL_PENDING;
-   g_stateReason[book]         = reason;
+   g_bk[book].state = EA_CLOSE_ALL_PENDING;
+   g_stateReason[book] = reason;
    LogTrade(book, "SIDE-EXIT", 0, 0.0, 0.0, 0.0, 0.0, reason);
   }
 
@@ -2043,8 +2187,8 @@ void TriggerCloseSide(int book, int cmd, string reason)
 void TriggerCloseAll(int book, string reason)
   {
    g_bk[book].closeSidePending = -1;
-   g_bk[book].state            = EA_CLOSE_ALL_PENDING;
-   g_stateReason[book]         = reason;
+   g_bk[book].state = EA_CLOSE_ALL_PENDING;
+   g_stateReason[book] = reason;
    LogTrade(book, "BASKET-EXIT", 0, 0.0, 0.0, 0.0, 0.0, reason);
   }
 
@@ -2054,7 +2198,10 @@ void TriggerCloseAll(int book, string reason)
 void ReconcileBrokerProtection(int book)
   {
    if(!g_atrValid || !IsTradeContextUsable())
-     { g_bk[book].nextRepairTime = TimeCurrent() + PROTECTION_REPAIR_BAD; return; }
+     {
+      g_bk[book].nextRepairTime = TimeCurrent() + PROTECTION_REPAIR_BAD;
+      return;
+     }
    RefreshRates();
    bool allGood = true;
    int nB = g_bk[book].buyCount;
@@ -2080,7 +2227,7 @@ void ReconcileBrokerProtection(int book)
          return;
      }
    g_bk[book].protectionDirty = !allGood;
-   g_bk[book].nextRepairTime  = TimeCurrent() + (allGood ? PROTECTION_REPAIR_OK : PROTECTION_REPAIR_BAD);
+   g_bk[book].nextRepairTime = TimeCurrent() + (allGood ? PROTECTION_REPAIR_OK : PROTECTION_REPAIR_BAD);
   }
 
 //+------------------------------------------------------------------+
@@ -2095,7 +2242,7 @@ bool ReconcileOne(int book, const COrderData &ord)
       tp = (ord.type == OP_BUY) ? (ord.openPrice + ATRDistance(InpIndivTP)) : (ord.openPrice - ATRDistance(InpIndivTP));
    if(ord.currentSL > 0.0)
      {
-      if(ord.type == OP_BUY  && sl > 0.0 && ord.currentSL > sl)
+      if(ord.type == OP_BUY && sl > 0.0 && ord.currentSL > sl)
          sl = ord.currentSL;
       if(ord.type == OP_SELL && sl > 0.0 && ord.currentSL < sl)
          sl = ord.currentSL;
@@ -2103,10 +2250,7 @@ bool ReconcileOne(int book, const COrderData &ord)
    if(sl > 0.0)
      {
       if((ord.type == OP_BUY && Bid <= sl) || (ord.type == OP_SELL && Ask >= sl))
-        {
-         TriggerCloseAll(book, "hard SL breach on ticket " + IntegerToString(ord.ticket));
-         return(false);
-        }
+        { TriggerCloseAll(book, "hard SL breach on ticket " + IntegerToString(ord.ticket)); return(false); }
      }
    ConformStops(ord.type, sl, tp);
    double tolerance = MathMax(InpMinModifyPoints * Point, Point * 0.5);
@@ -2121,9 +2265,15 @@ bool ReconcileOne(int book, const COrderData &ord)
 bool CheckAccountRiskStops()
   {
    if(InpMinEquity > 0.0 && AccountEquity() <= InpMinEquity)
-     { TriggerRiskStopAllBooks("equity floor", InpCloseAllOnDDStop); return(true); }
+     {
+      TriggerRiskStopAllBooks("equity floor", InpCloseAllOnDDStop);
+      return(true);
+     }
    if(InpMinMarginLevel > 0.0 && AccountMargin() > 0.0 && (AccountEquity() / AccountMargin() * 100.0) <= InpMinMarginLevel)
-     { TriggerRiskStopAllBooks("margin level breach", true); return(true); }
+     {
+      TriggerRiskStopAllBooks("margin level breach", true);
+      return(true);
+     }
    if(InpMaxDrawdownPct <= 0.0)
       return(false);
    double balance = AccountBalance();
@@ -2146,10 +2296,16 @@ bool CheckBookRiskStops(int book)
   {
    int open = CountOwnOrders(book);
    if(InpMaxBasketLossMoney > 0.0 && open > 0 && g_bk[book].floatingPL <= -InpMaxBasketLossMoney)
-     { TriggerRiskStop(book, "basket money stop", InpCloseAllOnDDStop); return(true); }
+     {
+      TriggerRiskStop(book, "basket money stop", InpCloseAllOnDDStop);
+      return(true);
+     }
    UpdateHistoryState(book, false);
    if(InpMaxSessionDDPct > 0.0 && g_bk[book].sessionDDPct >= InpMaxSessionDDPct)
-     { TriggerRiskStop(book, "session DD breach", InpCloseAllOnDDStop); return(true); }
+     {
+      TriggerRiskStop(book, "session DD breach", InpCloseAllOnDDStop);
+      return(true);
+     }
    return(false);
   }
 
@@ -2162,9 +2318,9 @@ void TriggerRiskStop(int book, string reason, bool closeOrders)
    LogTrade(book, "RISKSTOP", 0, 0.0, 0.0, 0.0, 0.0, reason);
    if(closeOrders && CountOwnOrders(book) > 0)
      {
-      g_bk[book].latchAfterClose  = true;
+      g_bk[book].latchAfterClose = true;
       g_bk[book].closeSidePending = -1;
-      g_bk[book].state            = EA_CLOSE_ALL_PENDING;
+      g_bk[book].state = EA_CLOSE_ALL_PENDING;
      }
    else
       LatchEquityStop(book, reason);
@@ -2174,11 +2330,7 @@ void TriggerRiskStop(int book, string reason, bool closeOrders)
 //|                                                                  |
 //+------------------------------------------------------------------+
 void TriggerRiskStopAllBooks(string reason, bool closeOrders)
-  {
-   for(int b = 0; b < BOOK_COUNT; b++)
-      if(g_bk[b].enabled)
-         TriggerRiskStop(b, reason, closeOrders);
-  }
+  { for(int b = 0; b < BOOK_COUNT; b++) if(g_bk[b].enabled) TriggerRiskStop(b, reason, closeOrders); }
 
 //====================================================================
 // CLOSE-ALL FSM
@@ -2186,7 +2338,7 @@ void TriggerRiskStopAllBooks(string reason, bool closeOrders)
 void DriveCloseAllFSM(int book)
   {
    bool protectionFault = (g_bk[book].state == EA_PROTECTION_FAULT);
-   bool latchAfter      = g_bk[book].latchAfterClose;
+   bool latchAfter = g_bk[book].latchAfterClose;
    if(CloseAllOwnOrdersPass(book))
      {
       g_bk[book].closeFailStreak = 0;
@@ -2197,7 +2349,7 @@ void DriveCloseAllFSM(int book)
         {
          g_bk[book].closeSidePending = -1;
          LogTrade(book, "SIDE-END", 0, 0.0, 0.0, 0.0, 0.0, "side close complete, basket #" + IntegerToString(g_bk[book].basketId) + " still open");
-         g_bk[book].state    = g_atrValid ? EA_RUNNING : EA_WAIT_ATR;
+         g_bk[book].state = g_atrValid ? EA_RUNNING : EA_WAIT_ATR;
          g_stateReason[book] = "side closed, basket live";
         }
       else
@@ -2222,7 +2374,7 @@ int SafeOrderSend(int book, int cmd, double lot, string comment)
   {
    if(!g_atrValid || !IsTradeContextUsable() || lot <= 0.0 || !ExposureAllows(book, lot, cmd))
       return(-1);
-   int ownBefore      = CountOwnOrders(book);
+   int ownBefore = CountOwnOrders(book);
    int oppositeBefore = (cmd == OP_BUY) ? g_bk[book].sellCount : g_bk[book].buyCount;
 
    RefreshRates();
@@ -2272,7 +2424,7 @@ int SafeOrderSend(int book, int cmd, double lot, string comment)
       return(ticket);
      }
 
-   g_bk[book].state    = EA_PROTECTION_FAULT;
+   g_bk[book].state = EA_PROTECTION_FAULT;
    g_stateReason[book] = "unprotected order " + IntegerToString(ticket);
    Alert("HOKKY V8.0 [", BookName(book), "]: order ", ticket, " could not be protected - entering PROTECTION_FAULT.");
    return(-1);
@@ -2301,8 +2453,8 @@ void ProbeNetting(int book, int cmd, int ownBefore, int oppositeBefore)
      }
 
    g_bk[book].nettingDetected = true;
-   g_bk[book].nettingProbed   = true;
-   g_stateReason[book]        = "netting account - pendulum adds blocked";
+   g_bk[book].nettingProbed = true;
+   g_stateReason[book] = "netting account - pendulum adds blocked";
    if(TimeCurrent() - g_nettingAlertTime > WARN_THROTTLE_SEC)
      {
       g_nettingAlertTime = TimeCurrent();
@@ -2346,8 +2498,8 @@ bool SafeOrderModify(int book, int ticket, double newSL, double newTP)
      {
       if(!OrderSelect(ticket, SELECT_BY_TICKET) || OrderCloseTime() > 0 || OrderSymbol() != Symbol() || OrderMagicNumber() != g_bk[book].magic || !IsTradeContextUsable())
          return(false);
-      int    cmd = OrderType();
-      double sl  = newSL, tp = newTP;
+      int cmd = OrderType();
+      double sl = newSL, tp = newTP;
       RefreshRates();
       ConformStops(cmd, sl, tp);
       if(MathAbs(sl - OrderStopLoss()) < Point * 0.5 && MathAbs(tp - OrderTakeProfit()) < Point * 0.5)
@@ -2426,7 +2578,7 @@ bool CloseAllOwnOrdersPass(int book)
    RefreshRates();
    int failures = 0, closed = 0;
    int target = g_bk[book].closeSidePending;
-   int magic  = g_bk[book].magic;
+   int magic = g_bk[book].magic;
    for(int i = OrdersTotal() - 1; i >= 0; i--)
      {
       if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES) || OrderSymbol() != Symbol() || OrderMagicNumber() != magic)
@@ -2437,9 +2589,9 @@ bool CloseAllOwnOrdersPass(int book)
       if(target >= 0 && type != target)
          continue;
       RefreshRates();
-      int    ticket = OrderTicket();
+      int ticket = OrderTicket();
       double volume = OrderLots();
-      double price  = (type == OP_BUY) ? Bid : Ask;
+      double price = (type == OP_BUY) ? Bid : Ask;
       ResetLastError();
       if(!OrderClose(ticket, volume, price, InpExitSlippage, clrYellow))
         {
@@ -2569,7 +2721,7 @@ double NormalizeLotDown(double lot)
    double step = MarketInfo(Symbol(), MODE_LOTSTEP);
    if(step <= 0.0)
       step = 0.01;
-   int    digits = LotDigits(step);
+   int digits = LotDigits(step);
    double result = MathFloor(lot / step + 1e-9) * step;
    result = NormalizeDouble(result, digits);
    double maxLot = MarketInfo(Symbol(), MODE_MAXLOT);
@@ -2586,7 +2738,7 @@ double NormalizeLotDown(double lot)
 int PositiveHash(string text)
   {
    uint hash = 5381;
-   int  len  = StringLen(text);
+   int len = StringLen(text);
    for(int i = 0; i < len; i++)
       hash = hash * 33 + (uint)StringGetChar(text, i);
    return((int)(hash & 0x7FFFFFFF));
@@ -2738,21 +2890,21 @@ void UpdateDashboard()
    if(!InpUseDashboard)
       return;
    int x = 12, y = 22, dy = 15, line = 0;
-   string adxText       = (g_adxValid ? DoubleToString(g_adx, 1) : "n/a");
-   bool   classicLive   = (g_bk[BOOK_CLASSIC].enabled  && RegimeAllowsClassic());
-   bool   pendulumLive  = (g_bk[BOOK_PENDULUM].enabled && RegimeAllowsPendulum());
+   string adxText = (g_adxValid ? DoubleToString(g_adx, 1) : "n/a");
+   bool classicLive = (g_bk[BOOK_CLASSIC].enabled && RegimeAllowsClassic());
+   bool pendulumLive = (g_bk[BOOK_PENDULUM].enabled && RegimeAllowsPendulum());
 
    SetLabel("00", x, y + dy * line++, "HOKKY V8.0 DUAL | " + Symbol() + " M" + IntegerToString(Period()) + " | ADX " + adxText + " (split " + DoubleToString(InpADXThreshold, 1) + ")", clrWhite, 9);
    SetLabel("01", x, y + dy * line++, "REGIME  CLASSIC: " + (g_bk[BOOK_CLASSIC].enabled ? (classicLive ? "ACTIVE (low ADX)" : "idle") : "off") + "    PENDULUM: " + (g_bk[BOOK_PENDULUM].enabled ? (pendulumLive ? "ACTIVE (high ADX)" : "idle") : "off"), (classicLive ? clrDodgerBlue : (pendulumLive ? clrTomato : clrSilver)), 9);
 
    for(int b = 0; b < BOOK_COUNT; b++)
      {
-      int   base = 10 + b * 4;
+      int base = 10 + b * 4;
       color head = (b == BOOK_PENDULUM) ? clrTomato : clrDodgerBlue;
       if(!g_bk[b].enabled)
          head = clrGray;
       SetLabel(IntegerToString(base), x, y + dy * line++, BookName(b) + " magic " + IntegerToString(g_bk[b].magic) + " | " + StateText(g_bk[b].state) + (IsEquityStopLatched(b) ? " LATCHED" : ""), head, 9);
-      SetLabel(IntegerToString(base + 1), x, y + dy * line++, "  n=" + IntegerToString(CountOwnOrders(b)) + " B" + IntegerToString(g_bk[b].buyCount) + "/S" + IntegerToString(g_bk[b].sellCount) + " lots=" + DoubleToString(g_bk[b].buyLots + g_bk[b].sellLots, 2) + " float=" + DoubleToString(g_bk[b].floatingPL, 2) + " lvl " + IntegerToString(CountOwnOrders(b)) + "/" + IntegerToString(MaxLevelForBook(b)) + ((EffectiveMaxLevel(b) < MaxLevelForBook(b)) ? " EFF " + IntegerToString(EffectiveMaxLevel(b)) : ""), clrSilver, 8);
+      SetLabel(IntegerToString(base + 1), x, y + dy * line++, "  n=" + IntegerToString(CountOwnOrders(b)) + " B" + IntegerToString(g_bk[b].buyCount) + "/S" + IntegerToString(g_bk[b].sellCount) + " lots=" + DoubleToString(g_bk[b].buyLots + g_bk[b].sellLots, 2) + " float=" + DoubleToString(g_bk[b].floatingPL, 2) + " lvl " + IntegerToString(g_bk[b].activeBasketLevel) + "/" + IntegerToString(MaxLevelForBook(b)) + ((EffectiveMaxLevel(b) < MaxLevelForBook(b)) ? " EFF " + IntegerToString(EffectiveMaxLevel(b)) : ""), clrSilver, 8);
       SetLabel(IntegerToString(base + 2), x, y + dy * line++, "  sessDD " + DoubleToString(g_bk[b].sessionDDPct, 2) + "%/" + DoubleToString(InpMaxSessionDDPct, 1) + "%  basket#" + IntegerToString(g_bk[b].basketId) + (g_bk[b].basketActive ? " active" : " idle") + "  next " + DoubleToString(g_bk[b].nextRecoveryLot, 2), clrSilver, 8);
       SetLabel(IntegerToString(base + 3), x, y + dy * line++, "  closeFails " + IntegerToString(g_bk[b].closeFailStreak) + "  trail " + (InpUseTrailingStop ? "ON" : "OFF") + (b == BOOK_PENDULUM ? ("  offset " + (InpUseHedgeOffset ? "ON" : "OFF") + (g_bk[b].nettingDetected ? "  NETTING!" : (g_bk[b].nettingProbed ? "  hedge OK" : "  probe..."))) : "  fade ladder"), (g_bk[b].nettingDetected ? clrRed : clrSilver), 8);
      }
